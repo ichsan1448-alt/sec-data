@@ -79,7 +79,7 @@ python "sec_data.py" --ticker AAPL
 
 Ticker input is converted to uppercase automatically, so these are equivalent:
 
---ticker AAPL
+--ticker aapl
 --ticker AAPL
 
 The script uses the ticker to find the company and its SEC filings.
