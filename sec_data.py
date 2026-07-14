@@ -5746,24 +5746,57 @@ def _classify_geographic_member(label: str, is_geographic_axis: bool = False):
     return 'region' if is_composite else 'country'
 
 
+# Geographic alias/basis consolidation v2.
+_GEO_DISPLAY_ALIASES = {
+    'us': 'United States', 'u s': 'United States', 'usa': 'United States',
+    'united states of america': 'United States',
+    'tw': 'Taiwan', 'sg': 'Singapore', 'cn': 'China', 'hk': 'Hong Kong',
+    'uk': 'United Kingdom', 'u k': 'United Kingdom',
+    'all other countries': 'Other', 'other countries': 'Other',
+    'all other countries not separately disclosed': 'Other',
+    'other countries not separately disclosed': 'Other',
+}
+_GEO_EXPLICIT_BASES = (
+    'Customer Billing Location',
+    'Customer Headquarters Location',
+    'Shipment Destination',
+)
+
+
+def _geo_alias_key(value: str) -> str:
+    return re.sub(r'[^a-z0-9]+', ' ', str(value or '').casefold()).strip()
+
+
+def _split_geographic_basis_suffix(member: str):
+    text = _geo_clean_member_text(member)
+    for basis in _GEO_EXPLICIT_BASES:
+        suffix = f' ({basis})'
+        if text.casefold().endswith(suffix.casefold()):
+            return text[:-len(suffix)].strip(), basis
+    return text, None
+
+
 def _canonical_geographic_member_label(label: str, is_geographic_axis: bool = False) -> str:
-    """Canonicalize punctuation/connectors only after geography is proven."""
+    """Canonicalize proven geography and common ISO/display aliases."""
     text = _geo_clean_member_text(label)
-    if _classify_geographic_member(text, is_geographic_axis) is None:
-        return text
-    text = text.replace('&', ' And ')
-    text = re.sub(r'[/|,+;:()\[\]{}]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Normalize only structural connector casing. Preserve issuer spelling and
-    # acronyms in country/region names (U.S., EMEA, APAC, etc.).
-    for word in (
-        'including', 'excluding', 'except', 'and', 'or', 'other', 'all',
-        'rest', 'remainder', 'greater', 'mainland', 'not', 'separately',
-        'disclosed', 'countries', 'country', 'regions', 'region',
-        'territories', 'territory',
-    ):
-        text = re.sub(rf'\b{word}\b', word.title(), text, flags=re.I)
-    return text
+    base_text, basis = _split_geographic_basis_suffix(text)
+    alias = _GEO_DISPLAY_ALIASES.get(_geo_alias_key(base_text))
+    if alias:
+        canonical = alias
+    else:
+        if _classify_geographic_member(base_text, is_geographic_axis) is None:
+            return text
+        canonical = base_text.replace('&', ' And ')
+        canonical = re.sub(r'[/|,+;:()\[\]{}]', ' ', canonical)
+        canonical = re.sub(r'\s+', ' ', canonical).strip()
+        for word in (
+            'including', 'excluding', 'except', 'and', 'or', 'other', 'all',
+            'rest', 'remainder', 'greater', 'mainland', 'not', 'separately',
+            'disclosed', 'countries', 'country', 'regions', 'region',
+            'territories', 'territory',
+        ):
+            canonical = re.sub(rf'\b{word}\b', word.title(), canonical, flags=re.I)
+    return f'{canonical} ({basis})' if basis else canonical
 
 
 @lru_cache(maxsize=65536, typed=True)
@@ -6015,17 +6048,42 @@ def _gb_has_positive_context(context: str) -> bool:
 
 
 def _gb_geographic_basis_from_context(context: str):
-    """Return an explicit geography basis only when the heading is unambiguous."""
-    lowered = _gb_clean_text(context).casefold()
-    detected = []
-    if re.search(r'\bcustomer\s+headquarters(?:\s+location)?\b|\bheadquartered\s+(?:in|at)\b', lowered):
-        detected.append('Customer Headquarters Location')
-    if re.search(r'\bcustomer\s+billing(?:\s+location)?\b|\bbilling\s+location\b', lowered):
-        detected.append('Customer Billing Location')
-    if re.search(r'\bship(?:ment|ments|ped|ping)(?:\s+to)?\s+(?:destination|location)\b|\bship-to\b', lowered):
-        detected.append('Shipment Destination')
-    unique = list(dict.fromkeys(detected))
-    return unique[0] if len(unique) == 1 else None
+    """Return the strongest explicit geographic reporting basis in context.
+
+    Customer headquarters and customer billing are accounting/reporting bases;
+    shipment language is often only explanatory narrative near the same table.
+    Therefore an explicit customer basis outranks incidental shipment text.
+    Shipment Destination is returned only when no customer-location basis is
+    present. This is generic and fail-closed for unrelated prose.
+    """
+    raw_context = _gb_clean_text(context)
+    raw_context = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', raw_context)
+    lowered = raw_context.replace('_', ' ').replace(':', ' ').casefold()
+    headquarters = bool(re.search(
+        r'\bcustomer(?:s|\'s)?\s+(?:headquarters|headquarter)(?:\s+location)?\b|'
+        r'\blocation\s+of\s+(?:the\s+)?customer(?:s|\'s)?\s+(?:headquarters|headquarter)\b|'
+        r'\bcustomer(?:s)?\s+(?:are|is)\s+headquartered\b|'
+        r'\bheadquarters(?:\s+location)?\s+of\s+(?:the\s+)?customer(?:s)?\b',
+        lowered,
+    ))
+    if headquarters:
+        return 'Customer Headquarters Location'
+
+    billing = bool(re.search(
+        r'\bcustomer(?:s|\'s)?\s+billing(?:\s+location)?\b|'
+        r'\bbilling\s+location(?:s)?\b|'
+        r'\blocation\s+where\s+(?:the\s+)?customer(?:s)?\s+(?:is|are)\s+billed\b',
+        lowered,
+    ))
+    if billing:
+        return 'Customer Billing Location'
+
+    shipment = bool(re.search(
+        r'\bshipment\s+destination(?:s)?\b|\bship-to(?:\s+location)?\b|'
+        r'\bdestination\s+to\s+which\s+(?:the\s+)?products?\s+(?:is|are|were)\s+shipped\b',
+        lowered,
+    ))
+    return 'Shipment Destination' if shipment else None
 
 
 def _gb_context_class(context: str):
@@ -6529,28 +6587,14 @@ def _gb_route_html_business_fact(fact: dict) -> dict:
 
 
 def _normalize_extracted_geographic_facts(extracted):
-    """Normalize proven geographic revenue facts from every extraction path.
+    """Normalize geographic facts without leaking one table basis across a filing.
 
-    This is a metadata-only pass. It never changes a numeric value, period,
-    concept, rank, duration, filing date, or source. Running it after XBRL,
-    HTML, and label-repair extraction prevents the same geographic series from
-    surviving in 4a, 4b, and 4c under punctuation variants.
-
-    When one filing contains an unambiguous table heading such as "customer
-    billing location" or "customer headquarters location", that source-backed
-    basis is propagated to all geographic revenue facts from that filing. If
-    more than one basis is present, propagation fails closed.
+    A filing may contain comparative billing-location XBRL and a new
+    headquarters-location table simultaneously. Basis is therefore attached
+    only when carried by the exact fact/table/axis/concept source.
     """
     if not extracted:
         return extracted
-
-    explicit_bases = set()
-    for fact in extracted:
-        basis = str(fact.get('SourceGeographicBasis') or '').strip()
-        if basis:
-            explicit_bases.add(basis)
-    filing_basis = next(iter(explicit_bases)) if len(explicit_bases) == 1 else None
-
     changed = 0
     for fact in extracted:
         if fact.get('Category') not in {
@@ -6562,21 +6606,25 @@ def _normalize_extracted_geographic_facts(extracted):
         metric, member = _split_segment_display_label(fact.get('Label'))
         if _normalize_label_key(metric) != 'revenue' or not member:
             continue
+        source_basis = str(fact.get('SourceGeographicBasis') or '').strip()
         axis_hint = fact.get('Category') in {
             '4b_Segments_Geographic_Regions',
             '4c_Segments_Geographic_Countries',
         }
         geo_kind = _classify_geographic_member(member, axis_hint)
+        if geo_kind is None and source_basis and _geo_alias_key(member) in {'other', 'all other'}:
+            geo_kind = 'region'
         if geo_kind is None:
             continue
-        canonical_member = _canonical_geographic_member_label(member, axis_hint)
+        canonical_member = (
+            'Other' if _geo_alias_key(member) in {'other', 'all other'}
+            else _canonical_geographic_member_label(member, axis_hint)
+        )
         target_category = (
             '4c_Segments_Geographic_Countries'
-            if geo_kind == 'country'
-            else '4b_Segments_Geographic_Regions'
+            if geo_kind == 'country' else '4b_Segments_Geographic_Regions'
         )
-        basis = str(fact.get('SourceGeographicBasis') or filing_basis or '').strip()
-        basis_suffix = f' ({basis})' if basis else ''
+        basis_suffix = f' ({source_basis})' if source_basis else ''
         target_label = f'{metric} - {canonical_member}{basis_suffix}'
         if fact.get('Category') != target_category or fact.get('Label') != target_label:
             fact['Category'] = target_category
@@ -6585,6 +6633,196 @@ def _normalize_extracted_geographic_facts(extracted):
     if changed:
         print(f"  [Geography] Normalized/routed {changed} geographic revenue fact(s).")
     return extracted
+
+
+def _geo_values_scale_equivalent(left, right) -> bool:
+    """True only for exact/effectively exact 1x, 1,000x or 1,000,000x copies."""
+    try:
+        left = float(left); right = float(right)
+    except (TypeError, ValueError):
+        return False
+    if not (np.isfinite(left) and np.isfinite(right)):
+        return False
+    if left == right:
+        return True
+    if left == 0 or right == 0 or (left < 0) != (right < 0):
+        return False
+    hi, lo = max(abs(left), abs(right)), min(abs(left), abs(right))
+    ratio = hi / lo
+    return any(abs(ratio - scale) <= 1e-8 * scale for scale in (1_000.0, 1_000_000.0))
+
+
+def _consolidate_geographic_alias_facts(df: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize geographic aliases and quarantine exact scale duplicates.
+
+    Runs before generic fact dedup. It may change Category/Label metadata for
+    proven geographic revenue facts and may drop only a smaller value that is
+    an exact 1,000x/1,000,000x unit copy of a larger candidate for the identical
+    label and period. No value is rescaled, derived, copied between periods, or
+    moved between different reporting bases.
+    """
+    required = {'Category', 'Label', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    geo_categories = {
+        '4a_Segments_Business',
+        '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries',
+    }
+    work = df.copy()
+    row_meta = {}
+
+    # Pass 1: identify explicit bases and canonical member names.
+    for idx, row in work.iterrows():
+        category = row.get('Category')
+        if category not in geo_categories:
+            continue
+        metric, member = _split_segment_display_label(row.get('Label'))
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        member_base, suffix_basis = _split_geographic_basis_suffix(member)
+        source_basis = str(row.get('SourceGeographicBasis') or '').strip()
+        explicit_basis = suffix_basis or (source_basis if source_basis in _GEO_EXPLICIT_BASES else None)
+        axis_hint = category in {
+            '4b_Segments_Geographic_Regions',
+            '4c_Segments_Geographic_Countries',
+        }
+        geo_kind = _classify_geographic_member(member_base, axis_hint)
+        # "Other" is geographic only when a source explicitly establishes a
+        # geographic reporting basis. Never route a generic business "Other".
+        if geo_kind is None and explicit_basis and _geo_alias_key(member_base) in {
+                'other', 'all other'}:
+            geo_kind = 'region'
+        if geo_kind is None:
+            continue
+        canonical_member = _canonical_geographic_member_label(member_base, axis_hint)
+        target_category = (
+            '4c_Segments_Geographic_Countries'
+            if geo_kind == 'country' else '4b_Segments_Geographic_Regions'
+        )
+        row_meta[idx] = {
+            'member': canonical_member,
+            'basis': explicit_basis,
+            'category': target_category,
+        }
+
+    if not row_meta:
+        return work
+
+    # Basis is never propagated across a whole filing; one filing may contain
+    # multiple geographic reporting bases.
+
+    # Pass 3: infer an unqualified alias's basis only from repeated identical
+    # overlaps with one explicit-basis series and zero material conflicts.
+    period_cols = [c for c in ('End', 'Duration', 'FY', 'Q') if c in work.columns]
+    explicit_series = defaultdict(lambda: defaultdict(list))
+    unqualified = defaultdict(list)
+    for idx, meta in row_meta.items():
+        period_key = tuple(work.at[idx, c] for c in period_cols)
+        value = work.at[idx, 'Value']
+        member = meta['member']
+        if meta['basis']:
+            explicit_series[(member, meta['basis'])][period_key].append(value)
+        else:
+            unqualified[member].append((idx, period_key, value))
+
+    for member, rows in unqualified.items():
+        candidate_scores = []
+        for (series_member, basis), values_by_period in explicit_series.items():
+            if series_member != member:
+                continue
+            matches = conflicts = 0
+            for _, period_key, value in rows:
+                candidates = values_by_period.get(period_key, ())
+                if not candidates:
+                    continue
+                if any(_geo_values_scale_equivalent(value, candidate)
+                       for candidate in candidates):
+                    matches += 1
+                else:
+                    conflicts += 1
+            if matches >= 2 and conflicts == 0:
+                candidate_scores.append((matches, basis))
+        if candidate_scores:
+            candidate_scores.sort(reverse=True)
+            if len(candidate_scores) == 1 or candidate_scores[0][0] > candidate_scores[1][0]:
+                winning_basis = candidate_scores[0][1]
+                for idx, _, _ in rows:
+                    row_meta[idx]['basis'] = winning_basis
+
+    # Pass 4: source-cohort inference. Assign an unqualified member only when
+    # at least two *other* geographic members from the same filing/period agree
+    # on one basis, no other basis is present, and there is no same-member
+    # explicit-basis value conflict. This fills omitted basis metadata without
+    # repeating the unsafe whole-filing propagation used by v1.
+    source_cols = [c for c in ('Filed', 'End', 'Duration', 'Start') if c in work.columns]
+    if source_cols:
+        source_groups = defaultdict(list)
+        for idx, meta in row_meta.items():
+            source_key = tuple(work.at[idx, c] for c in source_cols)
+            source_groups[source_key].append(idx)
+        for indices in source_groups.values():
+            bases = {row_meta[idx]['basis'] for idx in indices if row_meta[idx]['basis']}
+            evidence_members = {
+                row_meta[idx]['member'] for idx in indices if row_meta[idx]['basis']
+            }
+            if len(bases) != 1 or len(evidence_members) < 2:
+                continue
+            winning_basis = next(iter(bases))
+            for idx in indices:
+                meta = row_meta[idx]
+                if meta['basis']:
+                    continue
+                same_member_explicit = [
+                    other for other in indices
+                    if row_meta[other]['member'] == meta['member']
+                    and row_meta[other]['basis']
+                ]
+                if same_member_explicit:
+                    value = work.at[idx, 'Value']
+                    if not any(_geo_values_scale_equivalent(value, work.at[other, 'Value'])
+                               for other in same_member_explicit):
+                        continue
+                meta['basis'] = winning_basis
+
+    changed = 0
+    for idx, meta in row_meta.items():
+        suffix = f" ({meta['basis']})" if meta['basis'] else ''
+        target_label = f"Revenue - {meta['member']}{suffix}"
+        if work.at[idx, 'Category'] != meta['category']:
+            work.at[idx, 'Category'] = meta['category']; changed += 1
+        if work.at[idx, 'Label'] != target_label:
+            work.at[idx, 'Label'] = target_label; changed += 1
+
+    # Pass 5: remove only exact unit-scale duplicates for the identical series
+    # and period. The larger value is retained because sec-data's output unit is
+    # raw currency units; the smaller copy is an unscaled thousands/millions
+    # table value. Materially different values remain for normal restatement
+    # arbitration.
+    group_cols = ['Category', 'Label'] + period_cols
+    drop_idx = []
+    for _, group in work.loc[list(row_meta)].groupby(group_cols, dropna=False, sort=False):
+        numeric = pd.to_numeric(group['Value'], errors='coerce').dropna()
+        distinct = sorted(set(float(v) for v in numeric))
+        if len(distinct) < 2:
+            continue
+        max_abs = max(abs(v) for v in distinct)
+        if max_abs < 1_000_000:
+            continue
+        if not all(_geo_values_scale_equivalent(v, max_abs if v >= 0 else -max_abs)
+                   for v in distinct):
+            continue
+        for idx in group.index:
+            value = pd.to_numeric(pd.Series([work.at[idx, 'Value']]), errors='coerce').iloc[0]
+            if pd.notna(value) and abs(float(value)) < max_abs:
+                drop_idx.append(idx)
+
+    if drop_idx:
+        work = work.drop(index=sorted(set(drop_idx)))
+        print(f"  [Geography] Removed {len(set(drop_idx))} exact unit-scale duplicate fact(s).")
+    if changed:
+        print(f"  [Geography] Consolidated {changed} geographic alias/basis metadata field(s).")
+    return work
 
 
 def _gb_series_categories_compatible(html_category: str, xbrl_category: str) -> bool:
@@ -7214,7 +7452,15 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 'Category': seg_category, 'Label': label, 'Value': val,
                 'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                 'Filed': _filing_date_raw, 'TagRank': rank,
-                'DimCount': dim_count, 'IsCalculated': is_calculated, 'Concept': concept
+                'DimCount': dim_count, 'IsCalculated': is_calculated, 'Concept': concept,
+                'SourceGeographicBasis': (
+                    _gb_geographic_basis_from_context(
+                        ' '.join(str(c) for c in active_dim_cols) + ' ' + concept)
+                    if seg_category in {
+                        '4b_Segments_Geographic_Regions',
+                        '4c_Segments_Geographic_Countries',
+                    } else None
+                ),
             })
         
         elif matched_prefix and not captured_by_concept_map and dim_count == 0:
@@ -7245,7 +7491,8 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 'Category': seg_category, 'Label': label, 'Value': val,
                 'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                 'Filed': _filing_date_raw, 'TagRank': rank,
-                'DimCount': 0, 'IsCalculated': is_calculated, 'Concept': concept
+                'DimCount': 0, 'IsCalculated': is_calculated, 'Concept': concept,
+                'SourceGeographicBasis': _gb_geographic_basis_from_context(concept),
             })
 
     has_interest = any(x['Label'] == 'Interest Expense' for x in extracted)
@@ -9003,6 +9250,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _reconcile_segment_labels(df, ticker=ticker, company_name=company_name)
     df = _detect_and_merge_renamed_segments(df)
     df = _merge_concurrent_member_variants(df)
+    df = _consolidate_geographic_alias_facts(df)
 
     df['_End_dt'] = pd.to_datetime(df['End'], errors='coerce')
     df['_Filed_dt'] = pd.to_datetime(df['Filed'], errors='coerce')
@@ -18339,7 +18587,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-14.final-pivot.v18-geography-basis-routing"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-14.final-pivot.v19-geography-alias-consolidation"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
