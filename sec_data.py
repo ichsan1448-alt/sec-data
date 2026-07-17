@@ -4616,6 +4616,12 @@ def _is_segment_noise_value(concept, val):
 # Category sort order
 # ---------------------------------------------------------------------------
 CAT_ORDER = {
+    # The period-date metadata row must be the first data row in CSV/XLSX,
+    # immediately below the Category/Label column header.  The authoritative
+    # pre-write sorter also runs on cached pivots, so assigning it the only
+    # negative category rank keeps this invariant across fresh and cached
+    # quarterly/annual native outputs.
+    '0_Period_Header':      -1,
     '1_Income_Statement':    0,
     '2_Balance_Sheet':       1,
     '3_Cash_Flow':           2,
