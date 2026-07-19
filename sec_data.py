@@ -13,6 +13,7 @@ import json
 import pickle
 import sys
 import logging
+import math
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
@@ -92,14 +93,16 @@ def _calc_section_of(concept, max_hops=5):
     frontier = {concept}
     for _ in range(max_hops):
         nxt = set()
-        for c in frontier:
+        for c in sorted(frontier, key=str):
             if c in _CF_ROOTS:
                 return '3_Cash_Flow'
             if c in _IS_ROOTS:
                 return '1_Income_Statement'
             if c in _BS_ROOTS:
                 return '2_Balance_Sheet'
-            for p, _w in GLOBAL_CALC_PARENT.get(c, ()):
+            for p, _w in sorted(
+                    GLOBAL_CALC_PARENT.get(c, ()),
+                    key=lambda item: (str(item[0]), str(item[1]))):
                 nxt.add(p)
         if not nxt:
             return None
@@ -370,11 +373,13 @@ def _classify_calc_lineage(concepts, counted_concepts, targets, blockers, max_ho
     seen = set()
     for _ in range(max_hops):
         nxt = set()
-        for c, w in frontier:
+        for c, w in sorted(frontier, key=lambda item: (str(item[0]), float(item[1]))):
             if c in seen:
                 continue
             seen.add(c)
-            for p, pw in GLOBAL_CALC_PARENT.get(c, ()):
+            for p, pw in sorted(
+                    GLOBAL_CALC_PARENT.get(c, ()),
+                    key=lambda item: (str(item[0]), str(item[1]))):
                 try:
                     eff = w * (float(pw) if pw is not None else 1.0)
                 except (TypeError, ValueError):
@@ -2879,7 +2884,7 @@ def _keyword_is_pos(label: str) -> float:
         return 9
 
     # Sales & marketing / marketing-only operating expense.
-    if any(k in l for k in ('sales and marketing', 'sales & marketing',
+    if any(k in l for k in ('sale and marketing', 'sales & marketing',
                             'sales marketing', 'marketing')):
         return 10
 
@@ -4501,13 +4506,23 @@ SEGMENT_PREFIXES = [
     ('finitelivedintangibleassetusefullife', 'Useful Life - Intangibles'),
     ('revenueremainingperformanceobligationpercentage', 'RPO %'), 
     ('revenueremainingperformanceobligation', 'RPO Timing'),
+    # Preserve company-defined segment measures before broad GAAP keywords.
+    # A custom tag may contain both words (for example,
+    # ``SegmentContributionOperatingIncome``); the specific filed measure must
+    # win instead of being coerced into operating income.
+    ('segmentreportingotheritemamount', 'Other Segment Items'),
+    ('expensesattributabletosegment', 'Expenses Attributable to Segment'),
+    ('significantsegmentexpense', 'Significant Segment Expenses'),
+    ('othercostsandexpenses', 'Other Costs and Expenses'),
+    ('adjustedsegmentebitda', 'Adjusted Segment EBITDA'),
+    ('segmentcontribution', 'Contribution'),
+    ('contribution', 'Contribution'),
+    ('segmentprofit', 'Segment Profit'),
     ('operatingincome', 'Operating Income'),
     ('operatingprofit', 'Operating Income'),
-    ('segmentreportingotheritemamount', 'Operating Expenses'),
     ('operatingexpenses', 'Operating Expenses'),
     ('operatingcostsandexpenses', 'Operating Expenses'),
     ('netincome', 'Net Income'),
-    ('contribution', 'Operating Income'),
     ('grossprofit', 'Gross Profit'),
     ('income', 'Income'), 
     ('revenue', 'Revenue'),
@@ -4576,6 +4591,65 @@ CONSOLIDATION_AXIS = 'us-gaap:ConsolidationItemsAxis'
 # are equity components (retained earnings, AOCI cash-flow-hedge & defined-benefit
 # adjustments, treasury stock, NCI), not reportable business segments.
 EQUITY_COMPONENT_AXES = ('StatementEquityComponentsAxis', 'EquityComponentsAxis')
+
+
+def _dimension_axis_role_flags(column_name: str) -> dict:
+    """Classify one normalized ``dim_*Axis`` column conservatively.
+
+    Standard axes are recognized exactly; custom axes need strong semantic
+    names.  Generic fair-value, security-type, lease, tax, acquisition, and
+    other disclosure axes receive no segment role and therefore cannot fall
+    through into 4a.
+    """
+    text = str(column_name or '')
+    lower = text.casefold()
+    norm_business = {axis.replace(':', '_').casefold()
+                     for axis in BUSINESS_SEGMENT_AXES}
+    norm_geo = {axis.replace(':', '_').casefold()
+                for axis in GEOGRAPHIC_SEGMENT_AXES}
+    explicit_business = any(axis in lower for axis in norm_business)
+    explicit_geo = any(axis in lower for axis in norm_geo)
+    custom_business = (
+        text.endswith('Axis')
+        and any(token in lower for token in (
+            'reportablesegment', 'businesssegment', 'operatingsegment',
+            'segmentreporting', 'businessunit', 'businessline'))
+        and not any(token in lower for token in (
+            'geograph', 'country', 'region', 'territor', 'reconciliation',
+            'consolidation', 'supplemental', 'proforma', 'nongaap'))
+    )
+    # ``Location`` alone is not geographic evidence.  Derivative disclosures
+    # use axes such as LocationOfGainLossOnDerivativeInstrumentAxis; treating
+    # those as geography routed hedging gains into regional revenue.  Location
+    # is geographic only when the axis also identifies customers/revenue/sales.
+    custom_geo = (
+        text.endswith('Axis')
+        and (
+            any(token in lower for token in (
+                'geograph', 'country', 'region', 'territor'))
+            or ('location' in lower and any(token in lower for token in (
+                'customer', 'revenue', 'sales', 'geograph', 'country',
+                'region', 'territor')))
+        )
+    )
+    high_risk_nonsegment = any(token in lower for token in (
+        'fairvalue', 'securitytype', 'securitiestype', 'marketablesecurit',
+        'nonmarketablesecurit', 'derivative', 'hedging', 'interestcontract',
+        'tax', 'acquisition', 'businesscombination', 'intangibleasset',
+        'lease', 'debtinstrument', 'debtsecurity', 'stockclass',
+        'equitysecurity', 'cashflow', 'statementcashflows', 'creditquality',
+        'maturity', 'scenarioforecast', 'previouslyreported'))
+    return {
+        'business': bool(explicit_business or custom_business),
+        'geographic': bool(explicit_geo or custom_geo),
+        'product': 'productorserviceaxis' in lower,
+        'reconciliation': CONSOLIDATION_AXIS.replace(':', '_').casefold() in lower,
+        'equity_component': any(axis.casefold() in lower for axis in EQUITY_COMPONENT_AXES),
+        'supplemental_axis': any(token in lower for token in (
+            'supplemental', 'proforma', 'nongaap', 'adjustmentsfor')),
+        'incompatible_segment_axis': bool(high_risk_nonsegment),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Geographic Segment Detection (Regions vs Countries)
@@ -4737,7 +4811,10 @@ CAT_ORDER = {
 
 # Preferred metric-type order within segment sections
 SEGMENT_METRIC_ORDER = [
-    'Revenue', 'Operating Measure', 'Gross Profit', 'Operating Income', 'Operating Expenses', 'Net Income',
+    'Revenue', 'Operating Measure', 'Gross Profit', 'Operating Income',
+    'Contribution', 'Operating Expenses', 'Expenses Attributable to Segment',
+    'Other Costs and Expenses', 'Significant Segment Expenses',
+    'Other Segment Items', 'Net Income',
     'Assets', 'Liabilities', 'Depreciation', 'Amortization',
     'Capital Expenditures', 'Inventory', 'Inventory: Raw Materials', 'Inventory: Work in Process', 'Inventory: Finished Goods',
     'Operating Lease ROU Asset', 'Operating Lease Liability',
@@ -4752,7 +4829,10 @@ OPERATING_METRICS_CATEGORY = '4e_Operating_Metrics'
 
 # Genuine segment metrics that are considered core business segments
 GENUINE_SEGMENT_METRICS = {
-    'Revenue', 'Operating Measure', 'Gross Profit', 'Operating Income', 'Operating Expenses', 
+    'Revenue', 'Operating Measure', 'Gross Profit', 'Operating Income',
+    'Contribution', 'Operating Expenses', 'Expenses Attributable to Segment',
+    'Other Costs and Expenses', 'Significant Segment Expenses',
+    'Other Segment Items', 'Segment Profit',
     'Total Operating Expenses', 'Net Income', 'Cost of Revenue',
     'Depreciation', 'Amortization', 'Depreciation & Amortization',
     'Capital Expenditures', 'Inventory', 'Inventory: Raw Materials', 
@@ -5945,6 +6025,43 @@ def _canonical_geographic_member_label(label: str, is_geographic_axis: bool = Fa
 def _is_pure_geographic_label(label: str, is_geographic_axis: bool = False) -> bool:
     return _classify_geographic_member(label, is_geographic_axis) is not None
 
+def _infer_business_axis_semantic(member_labels) -> str:
+    """Classify a generic business-segment axis from its complete member set.
+
+    SEC filers may use StatementBusinessSegmentsAxis for geographic reportable
+    segments.  A high-consensus geographic member set is therefore geography;
+    a mixed set remains business even when some members are place names.
+    """
+    meaningful = []
+    for member in member_labels or ():
+        text = _normalize_member_label(str(member or '')).strip()
+        key = text.casefold()
+        if (not key or key in {
+                'operating segments', 'reportable segments', 'business segments',
+                'consolidated', 'total', 'all segments', 'eliminations',
+                'corporate and other'}):
+            continue
+        meaningful.append(text)
+    meaningful = list(dict.fromkeys(meaningful))
+    if len(meaningful) < 2:
+        return 'business'
+    geographic = sum(
+        bool(_is_pure_geographic_label(member, False))
+        for member in meaningful)
+    return 'geographic' if geographic / len(meaningful) >= 0.80 else 'business'
+
+
+def _gb_resolve_concept_axis_semantic(axis_semantic: str,
+                                      concept_member_labels) -> str:
+    """Resolve a concept subset without fragmenting the complete axis basis."""
+    if str(axis_semantic or 'business') == 'business':
+        return 'business'
+    labels = [label for label in (concept_member_labels or ()) if label]
+    if len(set(labels)) >= 2:
+        return _infer_business_axis_semantic(labels)
+    return str(axis_semantic or 'business')
+
+
 # ---------------------------------------------------------------------------
 # Generic table-structured business-breakdown rescue
 # ---------------------------------------------------------------------------
@@ -5964,14 +6081,27 @@ _GENERIC_BUSINESS_POSITIVE_CONTEXT_RE = tuple(re.compile(p, re.I) for p in (
     r'\brevenues?\s+by\s+(?:business|segment|product|service|market|geograph)',
     r'\bnet\s+sales\s+(?:information|by\s+groups?|by\s+segment)',
     r'\breportable\s+segment\s+financial\s+information',
+    r'\b(?:reportable\s+)?segment\s+results?\b',
     r'\boperating\s+income\s*\(loss\)?\s+by\s+segment',
     r'\bsummary\s+of\s+.{0,120}\b(?:business|segment|product|service)\b',
+    r'\bcosts?\s+of\s+revenues?\b',
+    r'\btraffic\s+acquisition\s+costs?\b',
+    r'\bsignificant\s+segment\s+expenses?\b',
+    r'\bexpenses?\s+attributable\s+to\s+(?:the\s+)?(?:reportable\s+)?segments?\b',
+    r'\bother\s+segment\s+items?\b',
+    r'\bsegment\s+(?:assets?|profit|contribution)\b',
+    r'\blong[- ]lived\s+assets?\s+by\s+geograph',
+    r'\bassets?\s+by\s+(?:segment|geograph|region|country)\b',
 ))
 
 _GENERIC_BUSINESS_DRIVER_CONTEXT_RE = tuple(re.compile(p, re.I) for p in (
     r'\bgrowth\s+trends?\s+in\s+(?:our|the)\s+key\s+drivers\b',
     r'\bsummary\s+of\s+(?:our|the)\s+key\s+(?:metrics|drivers)\b',
     r'\bkey\s+(?:operating|performance)\s+(?:metrics|drivers)\b',
+    r'\bfinancial\s+and\s+operational\s+highlights?\b',
+    r'\boperating\s+and\s+financial\s+highlights?\b',
+    r'\bassets?\s+under\s+custody(?:\s*\(auc\))?\b',
+    r'\btotal\s+platform\s+assets?\b',
 ))
 
 _GENERIC_BUSINESS_NEGATIVE_CONTEXT_RE = tuple(re.compile(p, re.I) for p in (
@@ -6005,12 +6135,605 @@ _GENERIC_BUSINESS_CORE_ACCOUNTING_LABELS = (
 
 _GENERIC_BUSINESS_NON_MONETARY_LABEL_RE = re.compile(
     r'\b(?:margin|percentage|percent|rate|ratio|per\s+share|eps|headcount|'
-    r'employees?|monthly\s+active|active\s+users?|users?|trips?|nights?\s+booked|'
+    r'employees?(?!\s+(?:compensation|expenses?|costs?))|monthly\s+active|active\s+users?|users?|trips?|nights?\s+booked|'
     r'units?\s+(?:sold|shipped)|subscribers?|customer\s+count)\b',
     re.I,
 )
 
 _HTML_BUSINESS_CONCEPT = 'HTMLBusinessBreakdown'
+
+# Explicit semantic roles for rescued HTML tables.  Nearby prose may qualify a
+# table for inspection, but the table's own title, headers, row grammar, and
+# totals decide its accounting role.  Unclassified or consolidated-
+# reconciliation tables fail closed instead of inheriting a stale Revenue
+# prefix from an earlier paragraph.
+_GB_ROLE_REPORTABLE_SEGMENT_PNL = 'reportable_segment_pnl'
+_GB_ROLE_REVENUE_DISAGG = 'revenue_disaggregation'
+_GB_ROLE_SEGMENT_EXPENSE = 'segment_expense_detail'
+_GB_ROLE_SEGMENT_ASSETS = 'segment_assets'
+_GB_ROLE_GEOGRAPHIC_REVENUE = 'geographic_revenue'
+_GB_ROLE_GEOGRAPHIC_ASSETS = 'geographic_assets'
+_GB_ROLE_COST_OF_REVENUE = 'cost_of_revenue_breakdown'
+_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE = 'significant_segment_expenses'
+_GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE = 'company_defined_segment_measure'
+_GB_ROLE_CONSOLIDATED_RECONCILIATION = 'consolidated_reconciliation'
+_GB_ROLE_OPERATING_METRIC = 'operating_metric'
+_GB_ROLE_UNCLASSIFIED = 'unclassified_disclosure'
+
+_GB_CONSOLIDATED_HEADER_RE = re.compile(
+    r'^(?:consolidated|total\s+company|company\s+total|reconciliation|'
+    r'corporate\s+and\s+other|eliminations?|all\s+other)$', re.I)
+_GB_GEOGRAPHIC_TEXT_RE = re.compile(
+    r'\b(?:geograph(?:y|ic|ical)|country|countries|region|regions|territor|'
+    r'international|domestic|united\s+states|u\.?s\.?)\b', re.I)
+_GB_ASSET_ROLE_RE = re.compile(
+    r'\b(?:segment\s+assets?|long[- ]lived\s+assets?|'
+    r'assets?\s+by\s+(?:segment|geograph|region|country))\b', re.I)
+_GB_COST_REVENUE_ROLE_RE = re.compile(
+    r'\b(?:costs?\s+of\s+revenues?|traffic\s+acquisition\s+costs?|tac|'
+    r'other\s+costs?\s+of\s+revenues?)\b', re.I)
+_GB_SEGMENT_EXPENSE_ROLE_RE = re.compile(
+    r'\b(?:significant\s+(?:segment\s+)?expenses?|expenses?\s+attributable\s+to'
+    r'\s+(?:the\s+)?(?:reportable\s+)?segments?|other\s+segment\s+items?|'
+    r'other\s+costs?\s+and\s+expenses?)\b', re.I)
+
+# Common ASC 280 significant-expense captions.  These are accounting rows,
+# not operating KPIs, and each row keeps its filed detail instead of inheriting
+# a nearby "Other segment items" subtotal.
+_GB_SIGNIFICANT_EXPENSE_DETAIL_RE = re.compile(
+    r'^(?:personnel(?:\s+expenses?)?|employee\s+compensation(?:\s+expenses?)?|'
+    r'professional\s+fees?|data\s+processing(?:\s+and\s+telecommunications)?|'
+    r'foreign\s+exchange\s+activity|advertising(?:\s+and\s+marketing)?|'
+    r'transaction[- ]based\s+fees?|non[- ]transaction[- ]based\s+fees?|'
+    r'platform\s+participant\s+direct\s+transaction\s+costs?|other\s+expenses?)$',
+    re.I,
+)
+
+
+def _gb_canonical_expense_detail(label: str) -> str:
+    text = _gb_row_label(label)
+    text = re.sub(r'[-–—]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    aliases = {
+        'personnel expenses': 'Personnel',
+        'personnel': 'Personnel',
+        'employee compensation expenses': 'Employee compensation',
+        'employee compensation': 'Employee compensation',
+        'professional fee': 'Professional fees',
+        'professional fees': 'Professional fees',
+        'data processing': 'Data processing and telecommunications',
+        'data processing and telecommunications': 'Data processing and telecommunications',
+        'foreign exchange activity': 'Foreign exchange activity',
+        'advertising': 'Advertising',
+        'advertising and marketing': 'Advertising and marketing',
+        'transaction based fee': 'Transaction-based fees',
+        'transaction based fees': 'Transaction-based fees',
+        'non transaction based fee': 'Non-transaction-based fees',
+        'non transaction based fees': 'Non-transaction-based fees',
+        'platform participant direct transaction cost': 'Platform Participant direct transaction costs',
+        'platform participant direct transaction costs': 'Platform Participant direct transaction costs',
+        'other expense': 'Other expenses',
+        'other expenses': 'Other expenses',
+    }
+    return aliases.get(text.casefold(), text[:1].upper() + text[1:])
+_GB_COMPANY_MEASURE_ROLE_RE = re.compile(
+    r'\b(?:segment\s+contribution|contribution|segment\s+profit|'
+    r'adjusted\s+segment\s+(?:income|profit|ebitda)|'
+    r'segment\s+adjusted\s+ebitda)\b', re.I)
+
+_GB_NON_MEMBER_ACCOUNTING_ROW_RE = re.compile(
+    r'^(?:net\s+sales|revenues?|cost\s+of\s+sales|costs?\s+of\s+revenues?|'
+    r'operating\s+expenses?|operating\s+income(?:\s*\(loss\))?|'
+    r'operating\s+profit|net\s+income|pretax\s+income|income\s+tax(?:es)?|'
+    r'equity[- ]method\s+investment\s+activity(?:,?\s+net\s+of\s+tax)?|'
+    r'other\s+operating\s+expense\s*\(income\)(?:,?\s+net)?|'
+    r'total\s+company|consolidated)$', re.I)
+
+
+# Section boundaries that must terminate the current semantic prefix.  These
+# headings commonly follow a valid segment table inside one SEC note.  Keeping
+# the prior prefix alive is what turned Amazon capital additions into Assets and
+# Palantir consolidated reconciliation rows into Contribution.
+_GB_SECTION_TERMINATOR_RE = re.compile(
+    r'^(?:total\s+net\s+additions?\s+to\s+(?:property|property\s+and\s+equipment)|'
+    r'net\s+additions?\s+to\s+(?:property|property\s+and\s+equipment)|'
+    r'capital\s+(?:additions?|expenditures?)|purchases?\s+of\s+property|'
+    r'depreciation\s+and\s+amortization|research\s+and\s+development|'
+    r'sales\s+and\s+marketing|general\s+and\s+administrative|'
+    r'adjusted\s+income\s+from\s+operations|income\s+from\s+operations|'
+    r'net\s+income|cash\s+flows?|operating\s+activities|investing\s+activities|'
+    r'financing\s+activities|reconciliation(?:\s+to.*)?|consolidated(?:\s+results?)?)$',
+    re.I)
+
+_GB_COMPANY_MEASURE_ACCOUNTING_NOISE_RE = re.compile(
+    r'\b(?:revenue|expenses?|costs?|research\s+and\s+development|sales\s+and\s+marketing|'
+    r'general\s+and\s+administrative|income\s+from\s+operations|adjusted\s+income|'
+    r'net\s+income|stock[- ]based|compensation|depreciation|amortization|interest|tax)\b',
+    re.I)
+
+
+# Tables immediately adjacent to a segment-assets disclosure often use the same
+# members but report a different metric (property/equipment, capital additions,
+# or depreciation).  Those metrics are useful disclosures, but they are not
+# ending segment assets and must never inherit an ``Assets`` prefix from nearby
+# prose.
+_GB_NON_ASSET_BALANCE_TABLE_RE = re.compile(
+    r'\b(?:total\s+net\s+additions?\s+to\s+(?:property|property\s+and\s+equipment)|'
+    r'net\s+additions?\s+to\s+(?:property|property\s+and\s+equipment)|'
+    r'capital\s+(?:additions?|expenditures?)|property\s+and\s+equipment,?\s+net\s+by\s+segment|'
+    r'purchases?\s+of\s+property|property\s+and\s+equipment\s+additions?|'
+    r'depreciation\s+and\s+amortization(?:\s+expense)?(?:,?\s+by\s+segment)?)\b',
+    re.I)
+
+# XBRL concept-level protection for segment assets.  A broad concept-name
+# match on ``assets`` is not enough: additions, capital expenditures, property
+# purchases, and depreciation are duration flows even when they are disclosed
+# beside an asset table and use the same segment members.
+_GB_SEGMENT_ASSET_BALANCE_CONCEPT_RE = re.compile(
+    r'^(?:assets|segmentassets|reportablesegmentassets|'
+    r'assetsbysegment|assetsbyreportablesegment|'
+    r'assetsattributabletosegment|assetsattributabletoreportablesegment|'
+    r'identifiableassets|segmentreportinginformationassets|'
+    r'segmentassetamount|reportablesegmentassetamount|'
+    r'assets of reportable segment)$'.replace(' ', ''),
+    re.I,
+)
+_GB_SEGMENT_ASSET_FLOW_CONCEPT_RE = re.compile(
+    r'(?:additions?|capitalexpenditures?|capex|purchases?|payments?toacquire|'
+    r'acquisitions?|propertyplantandequipment|productiveassets?|'
+    r'depreciation|amortization|expenditures?|cashpaid)',
+    re.I,
+)
+
+
+def _gb_segment_asset_concept_kind(concept: str, duration) -> str:
+    """Classify a dimensional concept proposed as ``Assets``.
+
+    Returns ``balance`` only for a strong asset-balance concept with an instant
+    period.  Flow/PPE concepts are returned separately so callers may preserve
+    them as disclosures without mislabelling them as ending segment assets.
+    """
+    compact = re.sub(r'[^a-z0-9]+', '', str(concept or '').casefold())
+    try:
+        duration_value = int(float(duration or 0))
+    except Exception:
+        duration_value = 0
+    if _GB_SEGMENT_ASSET_FLOW_CONCEPT_RE.search(compact):
+        if re.search(r'additions?|capitalexpenditures?|capex|purchases?|payments?toacquire|expenditures?', compact):
+            return 'capital_additions'
+        if 'propertyplantandequipment' in compact:
+            return 'property_plant_equipment'
+        return 'asset_related_flow'
+    if duration_value != 0:
+        return 'duration_nonbalance'
+    if _GB_SEGMENT_ASSET_BALANCE_CONCEPT_RE.fullmatch(compact):
+        return 'balance'
+    # Custom concepts often prepend an issuer namespace-specific qualifier.
+    # Require a clear segment/reportable + assets construction and no flow word.
+    if ('asset' in compact
+            and any(token in compact for token in (
+                'segmentasset', 'reportablesegmentasset', 'assetsbysegment',
+                'assetsbyreportablesegment', 'identifiableasset',
+                'attributabletosegment', 'attributabletoreportablesegment'))):
+        return 'balance'
+    return 'unknown'
+
+# Product/service-like member names that actually identify acquired intangible
+# asset classes.  A nearby revenue heading must not turn these into revenue
+# segments (for example customer relationships or reacquired rights).
+_GB_NON_REVENUE_MEMBER_RE = re.compile(
+    r'^(?:customer\s+relationships?|reacquired\s+rights?|developed\s+technology|'
+    r'trade\s+names?|trademarks?|patents?|contractual\s+relationships?|'
+    r'non[- ]compete\s+agreements?|order\s+backlog|goodwill|'
+    r'acquired\s+intangible(?:\s+assets?)?|finite[- ]lived\s+intangibles?)$',
+    re.I)
+
+
+def _gb_row_semantic_override(label: str, table_role: str,
+                              active_prefix: str | None):
+    """Return ``(action, prefix, member)`` from the row's own wording.
+
+    ``action`` is ``emit`` for an explicitly typed row, ``skip`` for a
+    reconciliation/accounting line, and ``inherit`` when the current section
+    prefix may be used.  Row-local semantics always outrank one table-wide role.
+    This is essential for multi-section ASC 280 tables such as Palantir's
+    Revenue / Expenses attributable to segment / Contribution disclosure.
+    """
+    text = _gb_clean_text(label).rstrip(':').strip()
+    lower = text.casefold()
+
+    def _member_case(value):
+        value = _gb_clean_text(value)
+        return value.title() if value and value == value.lower() else value
+    if not text:
+        return 'skip', None, None
+    if (_GB_CONSOLIDATED_HEADER_RE.match(lower)
+            or _GB_SECTION_TERMINATOR_RE.match(lower)):
+        return 'skip', None, None
+
+    # Explicit participant + metric rows.
+    m = re.match(r'^(.+?)\s+revenues?$', text, re.I)
+    if (m and table_role not in {
+            _GB_ROLE_COST_OF_REVENUE, _GB_ROLE_SEGMENT_EXPENSE,
+            _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE}
+            and not re.search(r'\b(?:costs?|expenses?)\b', m.group(1), re.I)):
+        member = _member_case(m.group(1))
+        if member.casefold() not in {'total', 'consolidated', 'company'}:
+            return 'emit', 'Revenue', member
+    m = re.match(
+        r'^expenses?\s+attributable\s+to\s+(?:the\s+)?(.+?)(?:\s+segment)?$',
+        text, re.I)
+    if m:
+        member = _member_case(re.sub(r'\s+segment$', '', _gb_clean_text(m.group(1)), flags=re.I))
+        return 'emit', 'Expenses Attributable to Segment', member
+    m = re.match(r'^(.+?)\s+(?:segment\s+)?contribution$', text, re.I)
+    if m:
+        return 'emit', 'Contribution', _member_case(m.group(1))
+    m = re.match(r'^(.+?)\s+segment\s+profit$', text, re.I)
+    if m:
+        return 'emit', 'Segment Profit', _member_case(m.group(1))
+    m = re.match(r'^other\s+costs?\s+and\s+expenses?\s*[-:]?\s*(.+)$', text, re.I)
+    if m:
+        return 'emit', 'Other Costs and Expenses', _member_case(m.group(1))
+
+    # Mixed single-segment ASC 280 tables can contain a separately reported
+    # "Other segment items" subtotal alongside individual significant
+    # expense captions.  The row's own caption outranks that table-wide phrase.
+    if (table_role in {_GB_ROLE_SEGMENT_EXPENSE,
+                       _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE}
+            and _GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(text)):
+        return ('emit', 'Significant Segment Expenses',
+                _gb_canonical_expense_detail(text))
+
+    # A company-defined-measure table may inherit Contribution only for a plain
+    # segment/member name.  Consolidated accounting/reconciliation rows cannot.
+    if table_role == _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE:
+        if _GB_COMPANY_MEASURE_ACCOUNTING_NOISE_RE.search(text):
+            return 'skip', None, None
+        if active_prefix in {
+                'Revenue', 'Expenses Attributable to Segment',
+                'Other Segment Items', 'Other Costs and Expenses',
+                'Significant Segment Expenses', 'Contribution',
+                'Segment Profit', 'Adjusted Segment EBITDA'}:
+            return 'inherit', active_prefix, text
+        return 'skip', None, None
+
+    return 'inherit', active_prefix, text
+
+
+def _gb_is_participant_header(label: str) -> bool:
+    """Return True for a scoped segment/member heading such as Google Cloud."""
+    text = _gb_clean_text(label).rstrip(':').strip()
+    lower = text.casefold()
+    if not text or len(text) > 90:
+        return False
+    if (_GB_CONSOLIDATED_HEADER_RE.match(lower)
+            or _GB_SECTION_TERMINATOR_RE.match(lower)
+            or _GB_NON_MEMBER_ACCOUNTING_ROW_RE.fullmatch(lower)
+            or _GB_CONTEXT_ROLE_BLOCKER_RE.search(text)):
+        return False
+    if re.search(
+            r'\b(?:supplemental|information|reconciliation|table|three\s+months|'
+            r'six\s+months|nine\s+months|year\s+ended|as\s+of|amount|percent|'
+            r'expenses?|costs?|revenues?|income|profit|contribution|assets?)\b',
+            text, re.I):
+        return False
+    return bool(re.search(r'[A-Za-z]', text))
+
+
+def _gb_participant_metric_override(label: str, participant: str | None):
+    """Map a numeric metric row under one participant heading."""
+    if not participant:
+        return None
+    text = _gb_clean_text(label).rstrip(':').strip()
+    normalized = text.casefold()
+    if normalized in {'other costs and expenses', 'other cost and expenses',
+                      'other costs and expense'}:
+        return 'Other Costs and Expenses', participant
+    if re.fullmatch(r'employee compensation(?: expenses?)?', normalized):
+        return ('Significant Segment Expenses',
+                f'{participant} - Employee Compensation')
+    if normalized in {'revenue', 'revenues', 'net sales'}:
+        return 'Revenue', participant
+    if normalized in {'operating expenses', 'total operating expenses'}:
+        return 'Operating Expenses', participant
+    if normalized in {'cost of revenue', 'cost of revenues', 'cost of sales'}:
+        return 'Cost of Revenue', participant
+    if normalized in {'operating income', 'operating income (loss)',
+                      'operating profit', 'earnings from operations'}:
+        return 'Operating Income', participant
+    if normalized in {'segment assets', 'assets', 'total assets'}:
+        return 'Assets', participant
+    if normalized in {'contribution', 'segment contribution'}:
+        return 'Contribution', participant
+    if normalized.startswith('total ') and re.search(
+            r'\b(?:costs?|expenses?|revenue|income|contribution)\b', normalized):
+        return 'skip', None
+    return None
+
+
+def _gb_table_role_corpus(table: pd.DataFrame, normalized: pd.DataFrame,
+                          context: str) -> str:
+    parts = [_gb_clean_text(context)]
+    source = normalized if normalized is not None and not normalized.empty else table
+    if source is not None and not source.empty:
+        parts.extend(_gb_flatten_column(column) for column in source.columns)
+        for row in source.head(40).itertuples(index=False, name=None):
+            parts.extend(_gb_clean_text(value) for value in row[:4])
+    return _gb_clean_text(' '.join(part for part in parts if part))
+
+
+def _gb_expense_prefix_from_corpus(corpus: str) -> str:
+    text = _gb_clean_text(corpus)
+    if re.search(r'\bexpenses?\s+attributable\s+to\s+(?:the\s+)?(?:reportable\s+)?segments?\b', text, re.I):
+        return 'Expenses Attributable to Segment'
+    if re.search(r'\bother\s+segment\s+items?\b', text, re.I):
+        return 'Other Segment Items'
+    if re.search(r'\bother\s+costs?\s+and\s+expenses?\b', text, re.I):
+        return 'Other Costs and Expenses'
+    if re.search(r'\bsignificant\s+(?:segment\s+)?expenses?\b', text, re.I):
+        return 'Significant Segment Expenses'
+    return 'Segment Expenses'
+
+
+def _gb_company_measure_prefix_from_corpus(corpus: str) -> str:
+    text = _gb_clean_text(corpus)
+    if re.search(r'\bcontribution\b', text, re.I):
+        return 'Contribution'
+    if re.search(r'\b(?:adjusted\s+segment|segment\s+adjusted)\s+ebitda\b', text, re.I):
+        return 'Adjusted Segment EBITDA'
+    if re.search(r'\bsegment\s+profit\b', text, re.I):
+        return 'Segment Profit'
+    return 'Company-defined Segment Measure'
+
+
+_GB_CONTEXT_ROLE_BLOCKER_RE = re.compile(
+    r'^(?:balance\s+as\s+of|net\s+income|operating\s+income|operating\s+expenses?|'
+    r'gross\s+profit|cash\s+and\s+cash\s+equivalents|operating\s+activities|'
+    r'investing\s+activities|financing\s+activities|net\s+increase.*cash|'
+    r'class\s+[a-z]\s+share\s+repurchases?|repurchases?\s+of\s+stock|stock\s+issued|'
+    r'diluted\s+net\s+income\s+per\s+share|marketable\s+securities|'
+    r'non[- ]marketable\s+securities|goodwill|property\s+and\s+equipment|'
+    r'operating\s+lease\s+assets?|other\s+current\s+assets?|'
+    r'other\s+non[- ]current\s+assets?|foreign\s+currency|gain\s*\(loss\)|'
+    r'income\s*\(loss\)|other\s+comprehensive\s+income|income\s+tax|'
+    r'tax\s+withholding|interest\s+income|performance\s+fees?)\b', re.I)
+
+_GB_COST_COMPONENT_RE = re.compile(
+    r'\b(?:traffic\s+acquisition|tac|other\s+costs?\s+of\s+revenues?|'
+    r'content\s+acquisition|data\s+center|hosting|fulfillment|payment\s+processing|'
+    r'distribution|inventory|bandwidth|royalt|licen[cs]e|delivery|customer\s+support|'
+    r'depreciation|amortization)\b', re.I)
+
+
+def _gb_table_local_corpus(table: pd.DataFrame,
+                           normalized: pd.DataFrame) -> str:
+    """Return evidence physically contained in one table.
+
+    Nearby prose is intentionally excluded.  The previous classifier combined
+    up to 2,400 characters of preceding narrative with every table, allowing a
+    single earlier heading such as ``Costs of revenues`` to relabel unrelated
+    balance-sheet, cash-flow, and equity tables.
+    """
+    return _gb_table_role_corpus(table, normalized, '')
+
+
+def _gb_context_member_table_compatible(labels, *, geographic=False) -> bool:
+    """True when context may safely supply a member-table role.
+
+    Context can name an otherwise headerless table (for example, ``Segment
+    assets`` above rows North America/International/AWS).  It cannot override
+    accounting-line rows, dated balances, cash-flow sections, or securities.
+    """
+    cleaned = []
+    for label in labels or ():
+        text = _gb_clean_text(label).rstrip(':').strip()
+        key = text.casefold()
+        # Only the member block before a consolidated/reconciliation header is
+        # relevant.  Accounting rows after that header must not invalidate an
+        # otherwise valid Amazon-style segment table.
+        if _GB_CONSOLIDATED_HEADER_RE.match(key):
+            break
+        if not text or key in {
+                'total', 'all segments', 'reportable segments',
+                'operating segments', 'segment', 'segments',
+                'revenue', 'revenues', 'net sales', 'operating income',
+                'operating income (loss)', 'operating expenses',
+                'cost of revenue', 'cost of revenues', 'contribution'}:
+            continue
+        cleaned.append(text)
+    if len(cleaned) < 2:
+        return False
+    if any(_GB_CONTEXT_ROLE_BLOCKER_RE.search(label) for label in cleaned):
+        return False
+    if any(_GB_NON_MEMBER_ACCOUNTING_ROW_RE.fullmatch(label.casefold())
+           for label in cleaned):
+        return False
+    if geographic:
+        geo = sum(bool(_is_pure_geographic_label(label, True))
+                  for label in cleaned)
+        return geo / len(cleaned) >= 0.50
+    return True
+
+
+def _gb_cost_breakdown_compatible(labels, local_corpus: str) -> bool:
+    """Require table-local cost components, not merely a nearby cost heading."""
+    cleaned = [
+        _gb_clean_text(label).rstrip(':').strip()
+        for label in labels or ()
+        if _gb_clean_text(label).rstrip(':').strip()
+    ]
+    meaningful = [label for label in cleaned if label.casefold() not in {
+        'cost of revenue', 'cost of revenues', 'total', 'consolidated'}]
+    if len(meaningful) < 2:
+        return False
+    if any(_GB_CONTEXT_ROLE_BLOCKER_RE.search(label) for label in meaningful):
+        return False
+    # A table listing broad expense captions (Cost of revenue, R&D, Sales and
+    # marketing, Total) is not a cost-of-revenue component table.  At least one
+    # actual component such as TAC/other cost of revenues must be present.
+    return bool(_GB_COST_COMPONENT_RE.search(local_corpus))
+
+
+def _gb_classify_business_table_role(table: pd.DataFrame,
+                                     normalized: pd.DataFrame,
+                                     context: str,
+                                     context_prefix: str | None):
+    """Return ``(role, prefix, confidence, analytical_basis)``.
+
+    Table-local evidence is authoritative.  Nearby prose is used only to name a
+    structurally compatible headerless member table; it can never turn an
+    unrelated accounting table into cost, asset, or segment data.
+    """
+    local_corpus = _gb_table_local_corpus(table, normalized)
+    context_corpus = _gb_clean_text(context)
+    local_lower = local_corpus.casefold()
+    context_lower = context_corpus.casefold()
+    labels = []
+    if normalized is not None and not normalized.empty:
+        labels = [_gb_row_label(v) for v in normalized.iloc[:, 0].tolist()]
+        labels = [label for label in labels if label]
+    label_lower = [label.casefold().rstrip(':').strip() for label in labels]
+
+    reconciliation_hits = sum(bool(_GB_CONSOLIDATED_HEADER_RE.match(label))
+                              for label in label_lower)
+    has_segment_sections = any(label in {
+        'revenue', 'revenues', 'net sales', 'operating income',
+        'operating income (loss)', 'operating expenses', 'cost of revenue',
+        'cost of revenues', 'contribution'} for label in label_lower)
+    if ((reconciliation_hits >= 2 and not has_segment_sections)
+            or ('reconciliation' in local_lower and not has_segment_sections)):
+        return (_GB_ROLE_CONSOLIDATED_RECONCILIATION, None, 0.99,
+                'consolidated_reconciliation')
+
+    has_revenue_section = any(label in {'revenue', 'revenues', 'net sales'}
+                              for label in label_lower)
+    has_profit_section = any(label in {
+        'operating income', 'operating income (loss)', 'operating profit',
+        'earnings from operations'} for label in label_lower)
+    has_expense_section = any(label in {
+        'operating expenses', 'expenses', 'cost of revenue', 'cost of revenues'}
+                              for label in label_lower)
+    if has_revenue_section and (has_profit_section or has_expense_section):
+        return (_GB_ROLE_REPORTABLE_SEGMENT_PNL, None, 0.99,
+                'reportable_segment_pnl')
+
+    # Explicit row-section evidence outranks a table-level asset/depreciation
+    # mention.  Modern single-segment disclosures often place significant
+    # segment expenses, depreciation and total segment assets in one table.
+    # Treating any depreciation/assets token as a veto discarded the expense
+    # section wholesale (mixed single-segment tables).  The row state machine below will
+    # still assign Assets an instant basis and terminate at unrelated sections.
+    if _GB_SEGMENT_EXPENSE_ROLE_RE.search(local_corpus):
+        prefix = _gb_expense_prefix_from_corpus(local_corpus)
+        role = (_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                if prefix == 'Significant Segment Expenses'
+                else _GB_ROLE_SEGMENT_EXPENSE)
+        return role, prefix, 0.995, 'segment_expense_detail'
+
+    # Explicit roles are first evaluated only from the table itself.
+    # A capital-additions / property-and-equipment table may sit directly below
+    # the segment-assets table and repeat the same member names.  It is a
+    # different metric and must fail closed before nearby ``segment assets``
+    # prose can classify it.
+    if (_GB_NON_ASSET_BALANCE_TABLE_RE.search(local_corpus)
+            and not re.search(r'\bsegment\s+assets?\b', local_corpus, re.I)):
+        return (_GB_ROLE_UNCLASSIFIED, None, 0.0, 'unclassified_disclosure')
+
+    if _GB_ASSET_ROLE_RE.search(local_corpus):
+        if re.search(r'\b(?:segment\s+assets?|assets?\s+by\s+segment)\b',
+                     local_corpus, re.I):
+            return (_GB_ROLE_SEGMENT_ASSETS, 'Assets', 0.995, 'segment_assets')
+        if re.search(r'\b(?:long[- ]lived\s+assets?|assets?\s+by\s+'
+                     r'(?:geograph|region|country))\b', local_corpus, re.I):
+            return (_GB_ROLE_GEOGRAPHIC_ASSETS, 'Assets', 0.995,
+                    'geographic_assets')
+
+    if (_GB_COST_REVENUE_ROLE_RE.search(local_corpus)
+            and _gb_cost_breakdown_compatible(labels, local_corpus)):
+        return (_GB_ROLE_COST_OF_REVENUE, 'Cost of Revenue', 0.995,
+                'cost_of_revenue_breakdown')
+
+    if _GB_SEGMENT_EXPENSE_ROLE_RE.search(local_corpus):
+        prefix = _gb_expense_prefix_from_corpus(local_corpus)
+        role = (_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                if prefix == 'Significant Segment Expenses'
+                else _GB_ROLE_SEGMENT_EXPENSE)
+        return role, prefix, 0.995, 'segment_expense_detail'
+
+    if _GB_COMPANY_MEASURE_ROLE_RE.search(local_corpus):
+        return (_GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE,
+                _gb_company_measure_prefix_from_corpus(local_corpus), 0.995,
+                'company_defined_segment_measure')
+
+    # Context may name a headerless table, but only after its rows prove that
+    # they are coherent members/components and contain no accounting blockers.
+    if _GB_ASSET_ROLE_RE.search(context_corpus):
+        if (re.search(r'\b(?:long[- ]lived\s+assets?|assets?\s+by\s+'
+                      r'(?:geograph|region|country))\b', context_corpus, re.I)
+                and _gb_context_member_table_compatible(labels, geographic=True)):
+            return (_GB_ROLE_GEOGRAPHIC_ASSETS, 'Assets', 0.985,
+                    'geographic_assets')
+        if (_gb_context_member_table_compatible(labels)
+                and re.search(r'\b(?:segment\s+assets?|assets?\s+by\s+segment)\b',
+                              context_corpus, re.I)):
+            return (_GB_ROLE_SEGMENT_ASSETS, 'Assets', 0.985, 'segment_assets')
+
+    if (_GB_SEGMENT_EXPENSE_ROLE_RE.search(context_corpus)
+            and _gb_context_member_table_compatible(labels)):
+        prefix = _gb_expense_prefix_from_corpus(context_corpus)
+        role = (_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                if prefix == 'Significant Segment Expenses'
+                else _GB_ROLE_SEGMENT_EXPENSE)
+        return role, prefix, 0.985, 'segment_expense_detail'
+
+    if (_GB_COMPANY_MEASURE_ROLE_RE.search(context_corpus)
+            and _gb_context_member_table_compatible(labels)):
+        return (_GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE,
+                _gb_company_measure_prefix_from_corpus(context_corpus), 0.985,
+                'company_defined_segment_measure')
+
+    # Narrative mentions of key metrics remain a weak fallback only after every
+    # financial table role has failed.
+    if (any(pattern.search(context_lower)
+            for pattern in _GENERIC_BUSINESS_DRIVER_CONTEXT_RE)
+            and _gb_context_member_table_compatible(labels)):
+        return (_GB_ROLE_OPERATING_METRIC, 'Operating Measure', 0.97,
+                'operating_metric')
+
+    if context_prefix == 'Operating Income':
+        if _gb_context_member_table_compatible(labels):
+            return (_GB_ROLE_REPORTABLE_SEGMENT_PNL, 'Operating Income', 0.96,
+                    'reportable_segment_pnl')
+    if context_prefix == 'Revenue':
+        if not _gb_context_member_table_compatible(labels):
+            return (_GB_ROLE_UNCLASSIFIED, None, 0.0, 'unclassified_disclosure')
+        if re.search(r'\b(?:reportable|business|operating)\s+segments?\b|'
+                     r'\bsegment\s+financial\s+information\b',
+                     context_corpus, re.I):
+            return (_GB_ROLE_REPORTABLE_SEGMENT_PNL, 'Revenue', 0.98,
+                    'reportable_segment_revenue')
+        if re.search(r'\b(?:revenues?|net\s+sales|assets?)\s+by\s+'
+                     r'(?:geograph|country|region)|\bgeographic\s+(?:revenue|information)|'
+                     r'\bcustomer\s+(?:location|headquarters|billing)\b',
+                     context_corpus, re.I):
+            return (_GB_ROLE_GEOGRAPHIC_REVENUE, 'Revenue', 0.98,
+                    'geographic_revenue')
+        return (_GB_ROLE_REVENUE_DISAGG, 'Revenue', 0.98,
+                'revenue_disaggregation')
+    return (_GB_ROLE_UNCLASSIFIED, None, 0.0, 'unclassified_disclosure')
+
+def _gb_route_for_table_role(role: str):
+    if role == _GB_ROLE_COST_OF_REVENUE:
+        return '1_Income_Statement'
+    if role == _GB_ROLE_OPERATING_METRIC:
+        return OPERATING_METRICS_CATEGORY
+    if role == _GB_ROLE_GEOGRAPHIC_ASSETS:
+        # Preserve the disclosed fact without pretending it is geographic
+        # revenue or a reportable business segment.
+        return '6_Disclosures'
+    return '4a_Segments_Business'
+
 
 # ---------------------------------------------------------------------------
 # Period and unit semantics for already-admitted operating-measure tables
@@ -6086,7 +6809,7 @@ _GB_MONEY_METRIC_RE = re.compile(
 _GB_COUNT_METRIC_RE = re.compile(
     r'\b(?:number|count)\s+of\b|'
     r'\b(?:monthly|daily|weekly)\s+active\s+users?\b|'
-    r'\b(?:mau|dau|wau|ncfa)\b|\bfunded\s+accounts?\b|'
+    r'\b(?:mau|dau|wau|ncfa|mapcs?)\b|\bfunded\s+accounts?\b|'
     r'\b(?:user|customer|subscriber|member|employee)\s+count\b|'
     r'\bheadcount\b|\btrips?\b|\bnights?\s+booked\b|'
     r'\bunits?\s+(?:sold|shipped)\b', re.I)
@@ -6108,17 +6831,20 @@ _GB_ACTIVITY_DRIVER_LABEL_RE = re.compile(
     r'\b(?:assessments?|fees?|processing|processed|volumes?|transactions?|'
     r'deposits?|withdrawals?|inflows?|outflows?|assets?|custody|auc|aum|'
     r'accounts?|users?|customers?|subscribers?|members?|trips?|bookings?|'
-    r'payments?|spend|arpu|mau|dau|wau|ncfa|subscription\s+revenues?|'
+    r'payments?|spend|arpu|mau|dau|wau|ncfa|mapcs?|subscription\s+revenues?|'
     r'proxy\s+revenues?|other\s+revenues?)\b', re.I)
 _GB_ACTIVITY_STRONG_DRIVER_RE = re.compile(
     r'\b(?:assessments?|fees?|processing|processed|volumes?|transactions?|'
     r'deposits?|withdrawals?|inflows?|outflows?|assets?|custody|auc|aum|'
     r'accounts?|users?|customers?|subscribers?|members?|trips?|bookings?|'
-    r'payments?|spend|arpu|mau|dau|wau|ncfa)\b', re.I)
+    r'payments?|spend|arpu|mau|dau|wau|ncfa|mapcs?)\b', re.I)
 _GB_ACTIVITY_ACCOUNTING_NOISE_RE = re.compile(
     r'\b(?:expenses?|costs?|compensation|overhead|marketing|technology|'
     r'development|software|cloud|provision|fair\s+value|net\s+income|'
-    r'net\s+loss|sbc|share[- ]based|interest\s+on|interest\s+revenues?)\b',
+    r'net\s+loss|sbc|share[- ]based|interest\s+on|interest\s+revenues?|'
+    r'professional\s+fees?|data\s+processing(?:\s+and\s+telecommunications)?|'
+    r'foreign\s+exchange\s+activity|personnel|advertising\s+and\s+marketing|'
+    r'depreciation|amortization)\b',
     re.I)
 
 
@@ -6173,8 +6899,11 @@ def _gb_operating_table_role(normalized: pd.DataFrame, value_header: str,
     if _GB_SNAPSHOT_CONTEXT_RE.search(_gb_clean_text(context)):
         return 'snapshot'
     balance_total = any(
-        str(label).strip().casefold().startswith('total ')
-        and _GB_BALANCE_LIKE_RE.search(label)
+        (str(label).strip().casefold().startswith('total ')
+         and _GB_BALANCE_LIKE_RE.search(label))
+        or bool(re.fullmatch(
+            r'(?:auc|aum|assets?\s+under\s+custody|total\s+platform\s+assets?)',
+            str(label).strip(), re.I))
         for label in labels
     )
     explicit_flows = sum(bool(_GB_FLOW_RE.search(label)) for label in labels)
@@ -6242,6 +6971,16 @@ def _gb_flatten_column(column) -> str:
                 parts.append(text)
         return ' | '.join(parts)
     return _gb_clean_text(column)
+
+
+def _gb_is_explicit_zero_dash(value) -> bool:
+    """True only for a rendered dash cell, not an empty/missing cell."""
+    raw = _gb_clean_text(value)
+    if not raw:
+        return False
+    return bool(re.fullmatch(
+        r'(?:\$|usd|u\.?s\.?\s*dollars?)?\s*[\-\u2012\u2013\u2014]+',
+        raw, re.I))
 
 
 def _gb_parse_number(value):
@@ -6408,6 +7147,106 @@ def _gb_detect_scale(context: str, table: pd.DataFrame) -> float | None:
     return 1.0
 
 
+
+def _gb_reference_magnitude_from_facts(existing_facts, fy=None, quarter=None):
+    """Return a conservative current-period monetary magnitude anchor.
+
+    Direct XBRL statement totals are already normalized to raw currency units.
+    They provide a generic way to distinguish an HTML table printed in millions
+    from one printed in raw dollars even when the SEC caption is detached from
+    the parsed leaf table.
+    """
+    values = []
+    preferred = {
+        'Revenue', 'Cost of Revenue', 'Gross Profit', 'Operating Income',
+        'Total Operating Expenses', 'Total Assets', 'Total Liabilities',
+        'Operating Cash Flow',
+    }
+    for fact in existing_facts or ():
+        if fact.get('Category') not in {
+                '1_Income_Statement', '2_Balance_Sheet', '3_Cash_Flow'}:
+            continue
+        if fy is not None and fact.get('FY') not in {fy, str(fy)}:
+            continue
+        if quarter is not None and str(fact.get('Q') or '') != str(quarter):
+            continue
+        if str(fact.get('Label') or '') not in preferred:
+            continue
+        try:
+            value = abs(float(fact.get('Value')))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0:
+            values.append(value)
+    return max(values) if values else None
+
+
+def _gb_resolve_financial_table_scale(table_scale: float | None,
+                                      normalized: pd.DataFrame,
+                                      value_positions,
+                                      reference_magnitude=None):
+    """Resolve raw/thousands/millions scale for financial HTML tables.
+
+    Explicit captions remain authoritative.  When a detached caption leaves the
+    parser with a nominal 1x scale, compare the table's displayed magnitudes with
+    direct XBRL statement totals.  The selected scale must move the largest
+    displayed value into a plausible financial range; otherwise fail closed.
+    """
+    if table_scale is None:
+        return None, 'mixed-explicit-scale'
+    try:
+        table_scale = float(table_scale)
+    except (TypeError, ValueError):
+        return None, 'invalid-scale'
+    if table_scale != 1.0:
+        return table_scale, 'explicit-table-scale'
+
+    displayed = []
+    if normalized is not None and not normalized.empty:
+        for row in normalized.itertuples(index=False, name=None):
+            value, _raw = _gb_coalesced_period_value(row, value_positions)
+            if value is not None and np.isfinite(value) and value != 0:
+                displayed.append(abs(float(value)))
+    if not displayed:
+        return 1.0, 'unit-scale-no-values'
+    raw_max = max(displayed)
+    try:
+        ref = abs(float(reference_magnitude))
+    except (TypeError, ValueError):
+        ref = 0.0
+    if not np.isfinite(ref) or ref <= 0:
+        # Without either an explicit caption or a direct XBRL anchor, guessing a
+        # financial scale is more dangerous than leaving the source in raw units.
+        return 1.0, 'raw-unit-no-anchor'
+    if raw_max >= 1_000_000:
+        # Displayed values already have raw-dollar magnitude.  Never turn a real
+        # but small line item into a billion/trillion-dollar value merely because
+        # it is a small percentage of the consolidated statement.
+        return 1.0, 'raw-dollar-magnitude'
+
+    candidates = []
+    for scale in (1.0, 1_000.0, 1_000_000.0):
+        ratio = raw_max * scale / ref
+        # Financial components can be small, but values below one ten-thousandth
+        # of a statement anchor are generally an unscaled presentation number.
+        if ratio <= 0 or ratio > 3.0:
+            continue
+        target = 0.10
+        score = abs(math.log10(max(ratio, 1e-12)) - math.log10(target))
+        if 0.001 <= ratio <= 1.5:
+            score -= 1.0
+        candidates.append((score, scale, ratio))
+    if not candidates:
+        return None, 'no-plausible-scale'
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _score, scale, ratio = candidates[0]
+    # Do not override raw units unless 1x is clearly implausible.
+    raw_ratio = raw_max / ref
+    if scale != 1.0 and raw_ratio >= 0.001:
+        return 1.0, 'raw-scale-plausible'
+    return float(scale), f'xbrl-anchor-ratio={ratio:.6g}'
+
+
 def _gb_is_count_metric(label: str) -> bool:
     text = _gb_clean_text(label)
     return bool(
@@ -6419,7 +7258,8 @@ def _gb_is_count_metric(label: str) -> bool:
 def _gb_infer_operating_row_unit(raw_label: str, label: str, row_unit: str,
                                  table_scale: float | None,
                                  table_has_money: bool,
-                                 period_has_money: bool):
+                                 period_has_money: bool,
+                                 table_geometry: str | None = None):
     """Infer ``(kind, scale, confidence, evidence)`` for one key-driver row.
 
     The inference is deliberately fail-closed.  A mixed-unit table (represented
@@ -6452,11 +7292,21 @@ def _gb_infer_operating_row_unit(raw_label: str, label: str, row_unit: str,
     elif _GB_MONEY_METRIC_RE.search(clean_label) or row_unit == 'money':
         unit_kind = 'money'
         semantic_evidence = 'money-label' if _GB_MONEY_METRIC_RE.search(clean_label) else 'row-currency'
-    elif table_scale is not None and table_has_money and period_has_money:
+    elif (table_scale is not None
+          and ((table_has_money and period_has_money)
+               or (table_geometry == 'snapshot'
+                   and float(table_scale) != 1.0))):
         # Homogeneous monetary tables often print a currency decorator on only
-        # the first row.  This fallback preserves that well-established layout.
+        # the first row.  A structurally proven point-in-time composition table
+        # may also list asset classes such as equities/options/cryptocurrency
+        # without repeating a currency sign on every row.  In that narrow case,
+        # an explicit non-unit table scale (thousands/millions/billions) is
+        # itself sufficient monetary evidence; otherwise fail closed.
         unit_kind = 'money'
-        semantic_evidence = 'homogeneous-money-table'
+        semantic_evidence = (
+            'snapshot-explicit-money-scale'
+            if table_geometry == 'snapshot'
+            else 'homogeneous-money-table')
     else:
         return None
 
@@ -6477,12 +7327,19 @@ def _gb_infer_operating_row_unit(raw_label: str, label: str, row_unit: str,
     elif unit_kind == 'count':
         if table_scale is None:
             return None
-        # A monetary-table caption is not evidence that a count is also scaled.
-        if float(table_scale) != 1.0 and table_has_money:
+        # A caption such as "in millions, except percentages" in a proven
+        # operating-highlights table applies to both monetary rows and counts
+        # (MAPCs, Trips, users).  Outside that bounded activity geometry, do not
+        # borrow a monetary scale for a count.
+        if (float(table_scale) != 1.0 and table_has_money
+                and table_geometry != 'activity'):
             return None
         scale = float(table_scale)
-        scale_evidence = 'homogeneous-count-table'
-        confidence = 0.94
+        scale_evidence = (
+            'explicit-activity-table-scale'
+            if table_geometry == 'activity' and float(table_scale) != 1.0
+            else 'homogeneous-count-table')
+        confidence = 0.97 if scale_evidence == 'explicit-activity-table-scale' else 0.94
     else:
         if table_scale is None:
             return None
@@ -6504,7 +7361,10 @@ def _gb_has_money_evidence(context: str, table: pd.DataFrame) -> bool:
         return True
     return any(term in lowered for term in (
         'revenue', 'net sales', 'operating income',
-        'earnings from operations'))
+        'earnings from operations', 'cost of revenue', 'costs of revenue',
+        'segment assets', 'long-lived assets', 'significant segment expense',
+        'expenses attributable to', 'other segment items',
+        'other costs and expenses', 'segment expenses', 'contribution'))
 
 
 def _gb_has_positive_context(context: str) -> bool:
@@ -6563,22 +7423,17 @@ def _gb_context_class(context: str):
         return False, None, 0.0
     if not _gb_has_positive_context(normalized):
         return False, None, 0.0
-    # Recurring monetary key-driver tables are not necessarily revenue tables.
-    # A nearby sentence can even explicitly say that the measures are not net
-    # revenue.  Qualify, but otherwise preserve, their source labels instead of
-    # letting an incidental mention of "revenue" manufacture a Revenue prefix.
-    # The generic prefix also keeps these rows visibly grouped beside revenue
-    # while making clear that they are a different type of series.
+    # Context only qualifies a table for structural inspection.  The final
+    # accounting role is assigned from the table itself by
+    # _gb_classify_business_table_role.
     if any(pattern.search(normalized)
            for pattern in _GENERIC_BUSINESS_DRIVER_CONTEXT_RE):
         return True, 'Operating Measure', 0.93
     if 'operating income' in normalized or 'earnings from operations' in normalized:
-        return True, 'Operating Income', 0.96
+        return True, 'Operating Income', 0.94
     if 'revenue' in normalized or 'net sales' in normalized:
-        return True, 'Revenue', 0.98
-    # Company-defined recurring monetary-driver table.  Preserve the source
-    # row label instead of encoding an industry-specific metric vocabulary.
-    return True, None, 0.93
+        return True, 'Revenue', 0.94
+    return True, None, 0.90
 
 
 def _gb_period_header_score(header: str, current_year: int,
@@ -6674,6 +7529,52 @@ def _gb_duration_from_header(header: str, fallback: int) -> int:
     return int(fallback)
 
 
+_GB_HEADER_DATE_PATTERNS = (
+    re.compile(
+        r'\b(?:january|february|march|april|may|june|july|august|september|'
+        r'october|november|december)\s+\d{1,2},?\s+\d{4}\b', re.I),
+    re.compile(r'\b\d{1,2}\s+(?:january|february|march|april|may|june|july|'
+               r'august|september|october|november|december)\s+\d{4}\b', re.I),
+    re.compile(r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b'),
+)
+
+
+def _gb_period_end_from_value_header(header, fallback_end):
+    """Return an explicit period-end date carried by one value column.
+
+    Comparative instant columns frequently point to the previous fiscal
+    year-end rather than the same quarter one year earlier.  Prefer the
+    column's own date when explicit; otherwise retain the caller's fallback.
+    """
+    fallback = pd.to_datetime(fallback_end, errors='coerce')
+    text = _gb_clean_text(header)
+    if text:
+        for pattern in _GB_HEADER_DATE_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            parsed = pd.to_datetime(match.group(0), errors='coerce')
+            if pd.notna(parsed):
+                return parsed.normalize()
+    return fallback
+
+
+def _gb_nearest_explicit_period_end(context, fallback_end):
+    """Bind a transposed table to the nearest date in its DOM context."""
+    fallback = pd.to_datetime(fallback_end, errors='coerce')
+    text = _gb_clean_text(context)
+    matches = []
+    for pattern in _GB_HEADER_DATE_PATTERNS:
+        for match in pattern.finditer(text):
+            parsed = pd.to_datetime(match.group(0), errors='coerce')
+            if pd.notna(parsed):
+                matches.append((match.start(), parsed.normalize()))
+    if not matches:
+        return fallback
+    # Nearby context is ordered nearest-first by _gb_nearby_table_context.
+    return min(matches, key=lambda item: item[0])[1]
+
+
 def _gb_row_label(value) -> str:
     text = _gb_clean_text(value)
     # Markers can appear on either side of a unit annotation and may have no
@@ -6689,13 +7590,40 @@ def _gb_row_label(value) -> str:
     # make one final bounded pass over the now-exposed annotation/marker.
     text = _GB_TRAILING_UNIT_ANNOTATION_RE.sub('', text).strip()
     text = _GB_TRAILING_FOOTNOTE_RE.sub('', text).strip()
+    # Plain trailing digits are common after pd.read_html flattens superscript
+    # footnotes (e.g. ``Advertising 3``).  Strip only a single terminal marker
+    # from a multi-letter label; preserve labels that are themselves numeric.
+    text = re.sub(r'(?<=[A-Za-z])\s+[1-9]$', '', text).strip()
     return text
 
 
 def _gb_section_from_header(label: str):
     normalized = str(label or '').lower().rstrip(':').strip()
+    if (_GB_CONSOLIDATED_HEADER_RE.match(normalized)
+            or _GB_SECTION_TERMINATOR_RE.match(normalized)):
+        return False, None
     if normalized in {'revenue', 'revenues', 'net sales'}:
         return True, 'Revenue'
+    if normalized in {'cost of revenue', 'cost of revenues'}:
+        return True, 'Cost of Revenue'
+    if normalized in {'operating expenses', 'total operating expenses'}:
+        return True, 'Operating Expenses'
+    if normalized in {'other costs and expenses'}:
+        return True, 'Other Costs and Expenses'
+    if normalized in {'expenses attributable to segment',
+                      'expenses attributable to the segment',
+                      'expenses attributable to reportable segments'}:
+        return True, 'Expenses Attributable to Segment'
+    if normalized in {'significant segment expenses', 'significant expenses'}:
+        return True, 'Significant Segment Expenses'
+    if normalized in {'other segment item', 'other segment items'}:
+        return True, 'Other Segment Items'
+    if normalized in {'contribution', 'segment contribution'}:
+        return True, 'Contribution'
+    if normalized in {'segment profit', 'adjusted segment ebitda'}:
+        return True, normalized.title().replace('Ebitda', 'EBITDA')
+    if normalized in {'segment assets', 'assets', 'total assets'}:
+        return True, 'Assets'
     if normalized in {
             'earnings from operations', 'operating income',
             'operating income (loss)', 'operating profit'}:
@@ -6705,19 +7633,247 @@ def _gb_section_from_header(label: str):
     return None
 
 
+
+_GB_COLUMNAR_SEGMENT_METRIC_RE = re.compile(
+    r'^(?:net\s+)?revenues?$|^net\s+sales$|'
+    r'^(?:segment\s+)?operating\s+income(?:\s*\(loss\))?$|^operating\s+profit|'
+    r'^(?:segment\s+adjusted|adjusted\s+segment)\s+ebitda$|'
+    r'^platform\s+participant\s+direct\s+transaction\s+costs?$|'
+    r'^depreciation(?:\s+and\s+amortization)?$|'
+    r'^other$', re.I)
+
+
+def _gb_columnar_member_from_header(header: str) -> str:
+    """Return one segment member encoded in a table column header."""
+    text = _gb_clean_text(header)
+    if not text:
+        return ''
+    candidates = []
+    for part in re.split(r'\s*\|\s*', text):
+        part = _gb_clean_text(part)
+        part = re.sub(r'^Unnamed:\s*\d+(?:_level_\d+)?$', '', part, flags=re.I)
+        part = re.sub(r'\.\d+$', '', part)
+        part = re.sub(
+            r'\b(?:three|six|nine|twelve)\s+months?\s+ended\b.*$', '', part,
+            flags=re.I)
+        part = re.sub(
+            r'\b(?:january|february|march|april|may|june|july|august|september|'
+            r'october|november|december)\s+\d{1,2},?\s+\d{4}\b', '', part,
+            flags=re.I)
+        part = re.sub(r'\b20\d{2}\b', '', part)
+        part = _gb_clean_text(part).strip(' -:')
+        if (not part or part in {'$', '%', '€', '£'}
+                or re.fullmatch(r'(?:amount|metric|segment|segments?|current|prior)', part, re.I)
+                or _GB_CONSOLIDATED_HEADER_RE.fullmatch(part.casefold())
+                or re.fullmatch(r'(?:total|company)', part, re.I)
+                or _GB_COLUMNAR_SEGMENT_METRIC_RE.fullmatch(part)):
+            continue
+        if len(part) <= 80 and re.search(r'[A-Za-z]', part):
+            candidates.append(part)
+    return candidates[-1] if candidates else ''
+
+
+def _gb_prepare_columnar_segment_grid(table: pd.DataFrame) -> pd.DataFrame:
+    """Normalize metric-rows × segment-columns presentation tables."""
+    if table is None or table.empty:
+        return pd.DataFrame()
+    df = table.copy().dropna(how='all', axis=0).dropna(how='all', axis=1)
+    if df.empty or len(df.columns) < 3:
+        return pd.DataFrame()
+    df.columns = [_gb_flatten_column(column) for column in df.columns]
+
+    def _member_count(columns):
+        return len({m for m in map(_gb_columnar_member_from_header, columns) if m})
+
+    if _member_count(df.columns) >= 2:
+        return df
+
+    # td-only SEC grids sometimes carry Mobility/Delivery/Freight in an ordinary
+    # row rather than <th> cells.  Promote only a row containing at least two
+    # distinct plausible member captions and no numeric data.
+    for pos in range(min(8, len(df))):
+        row = list(df.iloc[pos])
+        numeric = sum(_gb_parse_number(value)[0] is not None for value in row)
+        headers = [_gb_clean_text(value) for value in row]
+        members = {
+            _gb_columnar_member_from_header(value)
+            for value in headers[1:]
+            if _gb_columnar_member_from_header(value)
+        }
+        if numeric == 0 and len(members) >= 2:
+            new_columns = []
+            for idx, value in enumerate(headers):
+                new_columns.append(value or ('Metric' if idx == 0 else f'column_{idx}'))
+            promoted = df.iloc[pos + 1:].copy()
+            promoted.columns = new_columns
+            return promoted.dropna(how='all', axis=0).dropna(how='all', axis=1)
+    return pd.DataFrame()
+
+
+def _gb_columnar_metric_spec(label: str, table_corpus: str):
+    """Return (prefix, detail) for a column-oriented segment-table row."""
+    text = _gb_row_label(label).rstrip(':').strip()
+    key = text.casefold()
+    if re.fullmatch(r'(?:net\s+)?revenues?|net\s+sales', key):
+        return 'Revenue', None
+    if re.fullmatch(r'(?:(?:segment\s+)?operating\s+income(?:\s*\(loss\))?|operating\s+profit)', key):
+        return 'Operating Income', None
+    if re.fullmatch(r'(?:segment\s+adjusted|adjusted\s+segment)\s+ebitda', key):
+        return 'Adjusted Segment EBITDA', None
+    if re.fullmatch(r'depreciation(?:\s+and\s+amortization)?', key):
+        return 'Depreciation & Amortization', None
+    if _GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(text):
+        return 'Significant Segment Expenses', _gb_canonical_expense_detail(text)
+    if key == 'other' and re.search(
+            r'platform\s+participant\s+direct\s+transaction\s+costs?',
+            table_corpus, re.I):
+        return 'Significant Segment Expenses', 'Other'
+    return None
+
+
+def _extract_columnar_segment_breakdown_from_table(
+        table: pd.DataFrame, context: str, current_year: int,
+        preferred_duration: int = 90, reference_magnitude=None):
+    """Extract tables whose rows are metrics and columns are segment members.
+
+    This layout is common after the 2024 ASC 280 significant-expense adoption.
+    It is deliberately bounded to tables with at least two segment columns and
+    at least two explicit financial metric rows.
+    """
+    df = _gb_prepare_columnar_segment_grid(table)
+    if df.empty or len(df.columns) < 3:
+        return []
+    label_position = 0
+    # Prefer the column containing the strongest concentration of metric labels.
+    best = (-1, 0)
+    for pos in range(min(3, len(df.columns))):
+        labels = [_gb_row_label(value) for value in df.iloc[:, pos].tolist()]
+        score = sum(bool(_GB_COLUMNAR_SEGMENT_METRIC_RE.fullmatch(label))
+                    or bool(_GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(label))
+                    for label in labels if label)
+        if score > best[0]:
+            best = (score, pos)
+    label_position = best[1]
+    if best[0] < 2:
+        return []
+
+    member_positions = defaultdict(list)
+    for pos, column in enumerate(df.columns):
+        if pos == label_position:
+            continue
+        member = _gb_columnar_member_from_header(column)
+        if member:
+            member_positions[_normalize_label_key(member)].append((pos, member))
+    if len(member_positions) < 2:
+        return []
+
+    corpus = _gb_table_role_corpus(table, df, context)
+    specs = []
+    for ordinal, row in enumerate(df.itertuples(index=False, name=None)):
+        if label_position >= len(row):
+            continue
+        raw_label = _gb_clean_text(row[label_position])
+        spec = _gb_columnar_metric_spec(raw_label, corpus)
+        if spec is not None:
+            specs.append((ordinal, row, raw_label, spec))
+    if len(specs) < 2:
+        return []
+
+    table_scale = _gb_detect_scale(context, table)
+    if table_scale is None:
+        return []
+    if float(table_scale) == 1.0 and reference_magnitude:
+        displayed = []
+        for _, row, _, _ in specs:
+            for positions in member_positions.values():
+                value, _ = _gb_coalesced_period_value(
+                    row, [position for position, _ in positions])
+                if value is not None:
+                    displayed.append(abs(float(value)))
+        if displayed and max(displayed) < 1_000_000:
+            # Same conservative magnitude arbitration as ordinary financial
+            # tables when a detached caption omits "in millions".
+            raw_max = max(displayed)
+            ref = abs(float(reference_magnitude))
+            plausible = []
+            for scale in (1.0, 1_000.0, 1_000_000.0):
+                ratio = raw_max * scale / max(ref, 1.0)
+                if 0.001 <= ratio <= 1.5:
+                    plausible.append((abs(math.log10(ratio) - math.log10(0.10)), scale))
+            if plausible:
+                table_scale = min(plausible)[1]
+
+    candidates = []
+    duration = int(preferred_duration)
+    for ordinal, row, raw_label, (prefix, detail) in specs:
+        for positions in member_positions.values():
+            member = positions[0][1]
+            value, raw_value = _gb_coalesced_period_value(
+                row, [position for position, _ in positions])
+            if value is None:
+                continue
+            if detail:
+                display_label = f'{prefix} - {member} - {detail}'
+                metric_identity = _normalize_label_key(f'{prefix} {detail}')
+            else:
+                display_label = f'{prefix} - {member}'
+                metric_identity = _normalize_label_key(prefix)
+            period_basis = (_GB_BASIS_INSTANT_END if prefix == 'Assets'
+                            else _GB_BASIS_DURATION_FLOW)
+            scaled = float(value) * float(table_scale)
+            # Parentheses in segment-reconciliation tables show deductions.
+            # The published expense rows use positive expense magnitudes, while
+            # profit/loss measures retain their filed sign.
+            if prefix in {'Significant Segment Expenses',
+                          'Depreciation & Amortization'}:
+                scaled = abs(scaled)
+            nearest = round(scaled)
+            if abs(scaled - nearest) <= max(1e-6, abs(scaled) * 1e-12):
+                scaled = float(nearest)
+            candidates.append({
+                'SourceLabel': raw_label,
+                'RawSourceLabel': raw_label,
+                'Label': display_label,
+                'Value': scaled,
+                'RawValue': raw_value,
+                'DisplayDecimals': _gb_display_decimal_places(raw_value),
+                'Scale': float(table_scale),
+                'UnitKind': 'money',
+                'UnitConfidence': 0.99,
+                'UnitEvidence': 'columnar-segment-table-scale',
+                'Prefix': prefix,
+                'Confidence': 0.995,
+                'PeriodBasis': period_basis,
+                'BasisConfidence': 0.995,
+                'TableRole': (_GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE
+                              if prefix == 'Adjusted Segment EBITDA'
+                              else (_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                                    if prefix == 'Significant Segment Expenses'
+                                    else _GB_ROLE_REPORTABLE_SEGMENT_PNL)),
+                'TableGeometry': 'metric_rows_segment_columns',
+                'AnalyticalBasis': 'reportable_segment_pnl',
+                'Category': '4a_Segments_Business',
+                'SemanticType': prefix,
+                'AdmissionRule': 'columnar_segment_table',
+                'MetricFamily': None,
+                'MetricIdentity': metric_identity,
+                'Duration': 0 if period_basis == _GB_BASIS_INSTANT_END else duration,
+                'ValueHeader': str(current_year),
+                'SourceRowOrdinal': int(ordinal * 100 + positions[0][0]),
+            })
+    # A real reportable table must yield at least two metrics across two members.
+    return candidates if len(candidates) >= 4 else []
+
 def _extract_generic_business_breakdown_from_table(
         table: pd.DataFrame, context: str, current_year: int,
-        preferred_duration: int = 90):
+        preferred_duration: int = 90, reference_magnitude=None):
     """Return conservative source-backed business-table candidates.
 
     This pure helper is intentionally unit-testable without SEC/network access.
     """
+    if table is None or table.empty or len(table.columns) < 2:
+        return []
     eligible, default_prefix, base_confidence = _gb_context_class(context)
-    if not eligible or table is None or table.empty or len(table.columns) < 2:
-        return []
-    table_has_money = _gb_has_money_evidence(context, table)
-    if not table_has_money and default_prefix != 'Operating Measure':
-        return []
 
     normalized = _gb_normalize_table_grid(table, current_year)
     if normalized.empty or len(normalized.columns) < 2:
@@ -6730,24 +7886,63 @@ def _extract_generic_business_breakdown_from_table(
         normalized, value_position, value_header)
 
     duration = _gb_duration_from_header(value_header, preferred_duration)
+    table_role, role_prefix, role_confidence, analytical_basis = (
+        _gb_classify_business_table_role(
+            table, normalized, context, default_prefix))
+    if table_role in {
+            _GB_ROLE_CONSOLIDATED_RECONCILIATION,
+            _GB_ROLE_UNCLASSIFIED}:
+        return []
+    # Strong table-local evidence may rescue a table whose nearby prose is
+    # generic or contaminated, but broad revenue classification still requires
+    # the original positive context gate.
+    explicit_roles = {
+        _GB_ROLE_REPORTABLE_SEGMENT_PNL,
+        _GB_ROLE_SEGMENT_EXPENSE,
+        _GB_ROLE_SEGMENT_ASSETS,
+        _GB_ROLE_GEOGRAPHIC_ASSETS,
+        _GB_ROLE_COST_OF_REVENUE,
+        _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE,
+        _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE,
+        _GB_ROLE_OPERATING_METRIC,
+    }
+    if not eligible and table_role not in explicit_roles:
+        return []
+    default_prefix = role_prefix
+    base_confidence = min(0.995, max(float(base_confidence), float(role_confidence)))
+    table_has_money = _gb_has_money_evidence(context, table)
+    if not table_has_money and table_role != _GB_ROLE_OPERATING_METRIC:
+        return []
+
     # Detect unit scale from the original grid because td-only normalization
     # removes header/unit rows before candidate extraction.
     table_scale = _gb_detect_scale(context, table)
+    if table_role != _GB_ROLE_OPERATING_METRIC:
+        table_scale, table_scale_evidence = _gb_resolve_financial_table_scale(
+            table_scale, normalized, value_positions, reference_magnitude)
+        if table_scale is None:
+            return []
+    else:
+        table_scale_evidence = 'operating-unit-inference'
     period_has_money = any(
         _gb_row_unit_evidence(row, value_positions) == 'money'
         for row in normalized.itertuples(index=False, name=None)
     )
-    operating_table_role = (
+    operating_table_geometry = (
         _gb_operating_table_role(normalized, value_header, context)
-        if default_prefix == 'Operating Measure' else None
+        if table_role == _GB_ROLE_OPERATING_METRIC else None
     )
     rollforward_phase = None
-    active = True
+    # Multi-section reportable P&L tables must prove their first metric header;
+    # other explicit roles may begin immediately with their role-derived prefix.
+    active = table_role != _GB_ROLE_REPORTABLE_SEGMENT_PNL or bool(default_prefix)
     active_prefix = default_prefix
+    active_member = None
     candidates = []
     seen_labels = set()
 
-    for row in normalized.itertuples(index=False, name=None):
+    for source_row_ordinal, row in enumerate(
+            normalized.itertuples(index=False, name=None)):
         raw_source_label = _gb_clean_text(row[0])
         # Capture row scale before removing unit/footnote presentation syntax.
         label = _gb_row_label(raw_source_label)
@@ -6755,26 +7950,88 @@ def _extract_generic_business_breakdown_from_table(
             continue
         lowered = label.lower()
         numeric_count = sum(_gb_parse_number(value)[0] is not None for value in row[1:])
+        if (numeric_count == 0
+                and table_role == _GB_ROLE_OPERATING_METRIC
+                and operating_table_geometry == 'rollforward'):
+            numeric_count = sum(
+                _gb_is_explicit_zero_dash(value) for value in row[1:])
+        participant_override = (
+            _gb_participant_metric_override(label, active_member)
+            if numeric_count > 0 else None)
+        section_change = _gb_section_from_header(label)
+        # Section headers are semantic controls even when a flattened SEC grid
+        # leaves a numeric total in the same row.  Participant-scoped metric
+        # rows are the bounded exception: ``Google Services:`` followed by
+        # ``Other costs and expenses`` must emit the metric for that participant.
+        if (section_change is not None and participant_override is None
+                and not (table_role == _GB_ROLE_OPERATING_METRIC
+                         and numeric_count > 0)):
+            active, active_prefix = section_change
+            active_member = None
+            continue
         if numeric_count == 0:
-            section_change = _gb_section_from_header(label)
-            if section_change is not None:
-                active, active_prefix = section_change
+            # SEC tables do not consistently punctuate participant headings.
+            # A strongly validated plain member row (for example North America,
+            # International, or AWS) scopes the metric rows below it exactly as
+            # the colon form does.  Accounting/section captions still fail the
+            # participant predicate and therefore cannot activate this state.
+            if _gb_is_participant_header(label):
+                active_member = label.rstrip(':').strip()
+                active = True
             elif lowered.endswith(':'):
+                active_member = None
                 active = False
             continue
 
         if not active or value_position >= len(row):
             continue
 
+        if participant_override is not None:
+            if participant_override[0] == 'skip':
+                continue
+            row_action, row_prefix, row_member = (
+                'emit', participant_override[0], participant_override[1])
+        else:
+            row_action, row_prefix, row_member = _gb_row_semantic_override(
+                label, table_role, active_prefix)
+        if row_action == 'skip' or not row_member:
+            continue
+        effective_prefix = row_prefix or active_prefix
+        label = row_member
+        lowered = label.casefold()
+
+        # Acquired-intangible classes can appear in product/service tables near
+        # revenue disclosures.  Their member names are not revenue categories;
+        # preserving them as 4a rows produced false series such as ``Revenue -
+        # Customer relationships`` and ``Revenue - Reacquired rights``.
+        if (effective_prefix == 'Revenue'
+                and _GB_NON_REVENUE_MEMBER_RE.fullmatch(label.strip())):
+            continue
+
         period_basis = None
         basis_confidence = None
         metric_family = None
-        if active_prefix == 'Operating Measure':
+        if (effective_prefix == 'Assets'
+                or table_role in {_GB_ROLE_SEGMENT_ASSETS, _GB_ROLE_GEOGRAPHIC_ASSETS}):
+            # Period basis is a row property, not a whole-table property.  One
+            # ASC 280 table can contain significant expenses (flows) and total
+            # segment assets (instant).  Keeping this row-local prevents an
+            # asset line from converting sibling expenses to snapshots, and
+            # prevents expenses from forcing asset balances through Q4
+            # subtraction.
+            period_basis = _GB_BASIS_INSTANT_END
+            basis_confidence = 0.995
+        elif table_role != _GB_ROLE_OPERATING_METRIC:
+            # Revenue, cost, expense, profit and company-defined segment measures
+            # are duration flows unless the row explicitly proves otherwise.
+            period_basis = _GB_BASIS_DURATION_FLOW
+            basis_confidence = 0.97
+        if effective_prefix == 'Operating Measure':
             if _GB_INVALID_OPERATING_ROW_LABEL_RE.search(label):
                 continue
             period_basis, basis_confidence, rollforward_phase = (
                 _gb_infer_operating_row_semantics(
-                    label, value_header, operating_table_role, rollforward_phase
+                    label, value_header, operating_table_geometry, rollforward_phase
                 )
             )
             metric_family = _gb_operating_metric_family(label)
@@ -6789,7 +8046,7 @@ def _extract_generic_business_breakdown_from_table(
         # admitted operating-measure balance/rollforward total, where the total
         # is the strongest year-end source for an ending snapshot.
         is_operating_balance_total = (
-            active_prefix == 'Operating Measure'
+            effective_prefix == 'Operating Measure'
             and period_basis == _GB_BASIS_INSTANT_END
             and bool(_GB_BALANCE_LIKE_RE.search(label))
         )
@@ -6797,6 +8054,20 @@ def _extract_generic_business_breakdown_from_table(
                 and not is_operating_balance_total):
             continue
         if 'consolidated' in lowered or 'elimination' in lowered:
+            continue
+        if (table_role in {
+                _GB_ROLE_REPORTABLE_SEGMENT_PNL,
+                _GB_ROLE_REVENUE_DISAGG,
+                _GB_ROLE_GEOGRAPHIC_REVENUE,
+                _GB_ROLE_SEGMENT_ASSETS,
+                _GB_ROLE_GEOGRAPHIC_ASSETS,
+            }
+                and (_GB_NON_MEMBER_ACCOUNTING_ROW_RE.fullmatch(lowered)
+                     or _GB_CONTEXT_ROLE_BLOCKER_RE.search(label))):
+            continue
+        if (table_role == _GB_ROLE_COST_OF_REVENUE
+                and (not _GB_COST_COMPONENT_RE.search(label)
+                     or _GB_CONTEXT_ROLE_BLOCKER_RE.search(label))):
             continue
         if any(term in lowered for term in _GENERIC_BUSINESS_CORE_ACCOUNTING_LABELS):
             continue
@@ -6810,10 +8081,11 @@ def _extract_generic_business_breakdown_from_table(
 
         unit_confidence = None
         unit_evidence = None
-        if active_prefix == 'Operating Measure':
+        if effective_prefix == 'Operating Measure':
             unit_spec = _gb_infer_operating_row_unit(
                 raw_source_label, label, row_unit, table_scale,
                 table_has_money, period_has_money,
+                operating_table_geometry,
             )
             if unit_spec is None:
                 continue
@@ -6837,8 +8109,26 @@ def _extract_generic_business_breakdown_from_table(
 
         value, raw_value = _gb_coalesced_period_value(row, value_positions)
         if value is None:
-            continue
-        display_label = f'{active_prefix} - {label}' if active_prefix else label
+            # A dash in a proven operating rollforward is an explicit reported
+            # zero, not missing data.  Keep this bounded to rollforward tables;
+            # dashes elsewhere remain unknown and fail closed.
+            selected_raw = [
+                _gb_clean_text(row[position])
+                for position in value_positions
+                if position < len(row) and _gb_clean_text(row[position])
+            ]
+            explicit_zero = (
+                effective_prefix == 'Operating Measure'
+                and operating_table_geometry == 'rollforward'
+                and bool(selected_raw)
+                and all(_gb_is_explicit_zero_dash(raw)
+                        for raw in selected_raw)
+            )
+            if explicit_zero:
+                value, raw_value = 0.0, selected_raw[0]
+            else:
+                continue
+        display_label = f'{effective_prefix} - {label}' if effective_prefix else label
         normalized_label = re.sub(r'\s+', ' ', display_label).strip().casefold()
         if normalized_label in seen_labels:
             continue
@@ -6858,34 +8148,54 @@ def _extract_generic_business_breakdown_from_table(
             'Scale': float(row_scale),
             'UnitKind': unit_kind,
             'UnitConfidence': float(unit_confidence),
-            'UnitEvidence': unit_evidence,
-            'Prefix': active_prefix,
+            'UnitEvidence': f'{unit_evidence};{table_scale_evidence}',
+            'Prefix': effective_prefix,
             'Confidence': float(base_confidence),
             'PeriodBasis': period_basis,
             'BasisConfidence': basis_confidence,
-            'TableRole': operating_table_role,
+            'TableRole': table_role,
+            'TableGeometry': operating_table_geometry,
+            'AnalyticalBasis': analytical_basis,
+            'Category': _gb_route_for_table_role(table_role),
+            'SemanticType': effective_prefix,
+            'AdmissionRule': 'html_table_role',
             'MetricFamily': metric_family,
-            'Duration': int(duration),
+            'MetricIdentity': (
+                'ending_segment_assets'
+                if table_role == _GB_ROLE_SEGMENT_ASSETS
+                else ('geographic_long_lived_assets'
+                      if table_role == _GB_ROLE_GEOGRAPHIC_ASSETS
+                      else _normalize_label_key(effective_prefix or label))
+            ),
+            'Duration': (0 if period_basis in {
+                _GB_BASIS_INSTANT_START, _GB_BASIS_INSTANT_END}
+                else int(duration)),
             'ValueHeader': value_header,
+            'SourceRowOrdinal': int(source_row_ordinal),
         })
 
-    if (default_prefix == 'Operating Measure'
-            and operating_table_role not in {'rollforward', 'snapshot'}):
+    if (table_role == _GB_ROLE_OPERATING_METRIC
+            and operating_table_geometry not in {'rollforward', 'snapshot'}):
         # Homogeneous activity tables are admitted only when their row grammar
         # is made up of operating drivers.  This keeps MA-style assessments /
         # processing-fee tables, while rejecting expense-note tables that happen
         # to sit after an earlier "key drivers" sentence.
-        labels = [str(candidate.get('SourceLabel') or '') for candidate in candidates]
-        if any(_GB_ACTIVITY_ACCOUNTING_NOISE_RE.search(label) for label in labels):
-            return []
-        if sum(bool(_GB_ACTIVITY_STRONG_DRIVER_RE.search(label))
-               for label in labels) < 2:
-            return []
+        # Mixed "Financial and Operational Highlights" tables commonly
+        # include Revenue/Net income beside MAPCs, Trips and Gross Bookings.
+        # Rejecting the entire table because one accounting row is present loses
+        # every valid operating driver.  Filter row-by-row, then require at least
+        # two strong drivers so an expense table cannot masquerade as KPIs.
         candidates = [
             candidate for candidate in candidates
-            if _GB_ACTIVITY_DRIVER_LABEL_RE.search(
-                str(candidate.get('SourceLabel') or ''))
+            if (_GB_ACTIVITY_DRIVER_LABEL_RE.search(
+                    str(candidate.get('SourceLabel') or ''))
+                and not _GB_ACTIVITY_ACCOUNTING_NOISE_RE.search(
+                    str(candidate.get('SourceLabel') or '')))
         ]
+        if sum(bool(_GB_ACTIVITY_STRONG_DRIVER_RE.search(
+                str(candidate.get('SourceLabel') or '')))
+               for candidate in candidates) < 2:
+            return []
 
     # Multiple coherent rows are required.  This is the principal guard against
     # one-off nearby-number matches and unrelated accounting tables.
@@ -6970,6 +8280,64 @@ def _gb_nearby_table_context(table_tag, max_chars: int = 2400) -> str:
     return _gb_clean_text(' '.join(ordered))[:max_chars]
 
 
+def _gb_existing_fact_blocks_html_candidate(existing_rows, candidate) -> bool:
+    """Return True only when an existing fact is semantically equivalent.
+
+    A duration capital-additions fact must not block a direct instant HTML
+    segment-asset balance with the same display label.
+    """
+    existing_rows = list(existing_rows or ())
+    if not existing_rows:
+        return False
+    if (candidate.get('Prefix') == 'Assets'
+            and candidate.get('PeriodBasis') == _GB_BASIS_INSTANT_END):
+        for fact in existing_rows:
+            basis = str(fact.get('SourcePeriodBasis') or '')
+            role = str(fact.get('SourceTableRole') or '')
+            kind = str(fact.get('SourceAssetMetricKind') or '')
+            concept_kind = _gb_segment_asset_concept_kind(
+                fact.get('Concept'), fact.get('Duration'))
+            raw_value = fact.get('Value', None)
+            if raw_value is None:
+                value_is_usable = True  # legacy cached metadata omitted Value
+            else:
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    value = float('nan')
+                value_is_usable = np.isfinite(value) and value >= 0
+            # A generic table-role flag alone is not enough to block a direct
+            # HTML ending balance.  Stale/broad parses can carry the role while
+            # their concept is a duration flow.  Require usable value plus
+            # explicit balance identity from the concept or row metadata.
+            candidate_value = candidate.get('Value')
+            values_agree = (candidate_value is None or raw_value is None
+                            or _gb_close_values(raw_value, candidate_value))
+            if (basis == _GB_BASIS_INSTANT_END
+                    and value_is_usable
+                    and values_agree
+                    and (kind == 'balance' or concept_kind == 'balance')):
+                return True
+        return False
+    return True
+
+
+def _gb_resolve_candidate_duration(candidate: dict, preferred_duration: int) -> int:
+    """Preserve explicit zero-duration instant facts at HTML acceptance.
+
+    ``dict.get(...) or fallback`` incorrectly turns ``Duration=0`` into a
+    quarterly/annual duration because zero is falsy.  Only an absent or invalid
+    duration may inherit the filing-level fallback.
+    """
+    raw_duration = candidate.get('Duration')
+    if raw_duration is None or str(raw_duration).strip() == '':
+        return int(preferred_duration)
+    try:
+        return int(float(raw_duration))
+    except (TypeError, ValueError, OverflowError):
+        return int(preferred_duration)
+
+
 def _extract_generic_business_breakdowns_from_textblocks(
         facts_df: pd.DataFrame, filing_form: str, period_end_date,
         ye_month: int, filed, filing_url=None, existing_facts=None,
@@ -6992,12 +8360,14 @@ def _extract_generic_business_breakdowns_from_textblocks(
     current_year = int(end_dt.year)
     preferred_duration = 365 if '10-K' in form else 90
     existing_keys = set()
+    existing_by_key = defaultdict(list)
     for fact in existing_facts or ():
         if fact.get('Category') != '4a_Segments_Business':
             continue
         key = (re.sub(r'\s+', ' ', str(fact.get('Label') or '')).strip().casefold(),
                fact.get('FY'), fact.get('Q'))
         existing_keys.add(key)
+        existing_by_key[key].append(fact)
 
     text_blocks = facts_df[
         facts_df['concept'].astype(str).str.contains('TextBlock', case=False, na=False)
@@ -7007,17 +8377,39 @@ def _extract_generic_business_breakdowns_from_textblocks(
 
     def _accept_candidates(candidates, candidate_end_dt, source_period_role,
                            source_table_fingerprint, source_geographic_basis=None):
-        candidate_fy, candidate_q = get_period_info(candidate_end_dt, ye_month)
-        candidate_end_text = candidate_end_dt.strftime('%Y-%m-%d')
+        fallback_end_dt = pd.to_datetime(candidate_end_dt, errors='coerce')
         for candidate in candidates:
+            effective_end_dt = _gb_period_end_from_value_header(
+                candidate.get('ValueHeader'), fallback_end_dt)
+            if pd.isna(effective_end_dt):
+                continue
+            candidate_fy, candidate_q = get_period_info(effective_end_dt, ye_month)
+            candidate_end_text = effective_end_dt.strftime('%Y-%m-%d')
             label_key = re.sub(r'\s+', ' ', candidate['Label']).strip().casefold()
             fact_key = (label_key, candidate_fy, candidate_q)
-            if fact_key in existing_keys or fact_key in accepted_keys:
+            if ((fact_key in existing_keys
+                 and _gb_existing_fact_blocks_html_candidate(
+                     existing_by_key.get(fact_key, ()), candidate))
+                    or fact_key in accepted_keys):
                 continue
-            duration = int(candidate.get('Duration') or preferred_duration)
-            start_dt = candidate_end_dt - pd.Timedelta(days=duration)
+            duration = _gb_resolve_candidate_duration(
+                candidate, preferred_duration)
+            start_dt = (effective_end_dt if duration == 0
+                        else effective_end_dt - pd.Timedelta(days=duration))
+            # Immutable source-cell identity.  It survives later label/category
+            # normalization and lets reconciliation prove that one SEC table
+            # cell was published under conflicting semantics.
+            _cell_payload = '|'.join([
+                str(source_table_fingerprint or ''),
+                str(candidate.get('SourceRowOrdinal', '')),
+                _normalize_label_key(candidate.get('ValueHeader') or ''),
+                str(source_period_role or ''),
+                str(candidate.get('RawValue') or ''),
+            ])
+            _source_cell_identity = hashlib.sha1(
+                _cell_payload.encode('utf-8')).hexdigest()
             accepted.append({
-                'Category': '4a_Segments_Business',
+                'Category': candidate.get('Category', '4a_Segments_Business'),
                 'Label': candidate['Label'],
                 'Value': candidate['Value'],
                 'FY': candidate_fy,
@@ -7045,23 +8437,65 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'SourcePeriodBasis': candidate.get('PeriodBasis'),
                 'SourceBasisConfidence': candidate.get('BasisConfidence'),
                 'SourceTableRole': candidate.get('TableRole'),
+                'SourceTableGeometry': candidate.get('TableGeometry'),
+                'SourceAssetMetricKind': (
+                    'balance' if candidate.get('TableRole') in {
+                        _GB_ROLE_SEGMENT_ASSETS, _GB_ROLE_GEOGRAPHIC_ASSETS}
+                    else None
+                ),
                 'SourceMetricFamily': candidate.get('MetricFamily'),
+                'SourceMetricIdentity': candidate.get('MetricIdentity'),
+                'SourceKind': 'html_table',
+                'SourceAdmissionRule': candidate.get('AdmissionRule'),
+                'SourceSemanticType': candidate.get('SemanticType'),
+                'SourceAnalyticalBasis': candidate.get('AnalyticalBasis'),
+                'SourceDirectness': 'reported',
+                'SourceClassificationConfidence': candidate.get('Confidence'),
                 'SourcePeriodRole': source_period_role,
                 'SourceTableFingerprint': source_table_fingerprint,
+                'SourceRowOrdinal': candidate.get('SourceRowOrdinal'),
+                'SourceCellIdentity': _source_cell_identity,
                 'SourceGeographicBasis': source_geographic_basis,
             })
             accepted_keys.add(fact_key)
 
     def _accept_table(table, context):
         table_fingerprint = _gb_table_fingerprint(table)
+        current_fy, current_q = get_period_info(end_dt, ye_month)
+        current_reference = _gb_reference_magnitude_from_facts(
+            existing_facts, current_fy, current_q)
+        geographic_basis = _gb_geographic_basis_from_context(context)
+
+        # Modern ASC 280 tables often transpose the usual geometry: metrics are
+        # rows and reportable segments are columns.  Parse that layout first; the
+        # ordinary period-column parser below remains authoritative for standard
+        # tables and operating highlights.
+        columnar_candidates = _extract_columnar_segment_breakdown_from_table(
+            table, context, current_year,
+            preferred_duration=preferred_duration,
+            reference_magnitude=current_reference)
+        if columnar_candidates:
+            columnar_end = _gb_nearest_explicit_period_end(context, end_dt)
+            columnar_role = (
+                'comparative'
+                if pd.notna(columnar_end) and pd.notna(end_dt)
+                and int(columnar_end.year) < int(end_dt.year)
+                else 'current'
+            )
+            _accept_candidates(
+                columnar_candidates, columnar_end, columnar_role,
+                table_fingerprint, geographic_basis)
+
         candidates = _extract_generic_business_breakdown_from_table(
             table, context, current_year,
-            preferred_duration=preferred_duration)
-        if not candidates:
+            preferred_duration=preferred_duration,
+            reference_magnitude=current_reference)
+        if candidates:
+            _accept_candidates(
+                candidates, end_dt, 'current', table_fingerprint, geographic_basis)
+
+        if not candidates and not columnar_candidates:
             return
-        geographic_basis = _gb_geographic_basis_from_context(context)
-        _accept_candidates(
-            candidates, end_dt, 'current', table_fingerprint, geographic_basis)
 
         # Comparative columns carry an explicit prior-year header and the same
         # quarter/annual duration.  They safely backfill an earlier period when
@@ -7070,14 +8504,131 @@ def _extract_generic_business_breakdowns_from_textblocks(
         # year column; this prevents a stale historical table from being
         # relabeled as a newer period.
         comparative_year = current_year - 1
+        comparative_fy, comparative_q = get_period_info(
+            end_dt - pd.DateOffset(years=1), ye_month)
+        comparative_reference = _gb_reference_magnitude_from_facts(
+            existing_facts, comparative_fy, comparative_q)
         comparative_candidates = _extract_generic_business_breakdown_from_table(
             table, context, comparative_year,
-            preferred_duration=preferred_duration)
+            preferred_duration=preferred_duration,
+            reference_magnitude=comparative_reference)
         if comparative_candidates:
             comparative_end_dt = end_dt - pd.DateOffset(years=1)
             _accept_candidates(
                 comparative_candidates, comparative_end_dt, 'comparative',
                 table_fingerprint, geographic_basis)
+
+    def _accept_table_safely(table, context):
+        """Isolate malformed SEC tables so later valid tables still parse."""
+        try:
+            _accept_table(table, context)
+            return True
+        except Exception as table_error:
+            _debug_print(
+                f"  [Business Table] Skipped one malformed table "
+                f"({type(table_error).__name__}: {table_error})")
+            return False
+
+    _strong_table_anchor_re = re.compile(
+        r'total\s+segment\s+assets?.{0,100}(?:as\s+follows|reconciled)|'
+        r'financial\s+and\s+operational\s+highlights?|'
+        r'operating\s+and\s+financial\s+highlights?', re.I)
+
+    def _reconstruct_segment_asset_anchor_grid(parsed_tables, anchor_text):
+        """Rejoin nested header/body fragments under an explicit asset anchor.
+
+        SEC inline HTML sometimes stores date headers in one child table and
+        member/value rows in another.  pandas correctly returns separate
+        frames, but neither frame is independently meaningful.  Reconstruct
+        only when the nearby anchor explicitly identifies total segment assets,
+        and require at least three member rows plus two numeric value columns.
+        """
+        if not re.search(r'total\s+segment\s+assets?|segment\s+assets?',
+                         _gb_clean_text(anchor_text), re.I):
+            return None
+        date_headers = []
+        for frame in parsed_tables or ():
+            tokens = [_gb_flatten_column(column) for column in frame.columns]
+            for row in frame.head(3).itertuples(index=False, name=None):
+                tokens.extend(_gb_clean_text(value) for value in row)
+            for token in tokens:
+                for pattern in _GB_HEADER_DATE_PATTERNS:
+                    for match in pattern.finditer(str(token or '')):
+                        text = _gb_clean_text(match.group(0))
+                        if text and text not in date_headers:
+                            date_headers.append(text)
+        if len(date_headers) < 2:
+            return None
+
+        best = None
+        best_score = -1
+        for frame in parsed_tables or ():
+            body = frame.copy().dropna(how='all', axis=0).dropna(how='all', axis=1)
+            if body.empty or len(body.columns) < 3:
+                continue
+            label_pos = 0
+            labels = [_gb_row_label(value) for value in body.iloc[:, label_pos]]
+            member_count = sum(bool(label) and not _GB_CONSOLIDATED_HEADER_RE.match(
+                label.casefold()) for label in labels)
+            numeric_positions = []
+            for pos in range(1, len(body.columns)):
+                numeric_count = sum(
+                    _gb_parse_number(value)[0] is not None
+                    for value in body.iloc[:, pos].tolist())
+                if numeric_count >= 2:
+                    numeric_positions.append(pos)
+            score = member_count * 10 + len(numeric_positions)
+            if member_count >= 3 and len(numeric_positions) >= 2 and score > best_score:
+                best = (body, label_pos, numeric_positions)
+                best_score = score
+        if best is None:
+            return None
+        body, label_pos, numeric_positions = best
+        value_positions = numeric_positions[-len(date_headers):]
+        if len(value_positions) < 2:
+            return None
+        headers = date_headers[-len(value_positions):]
+        rebuilt = pd.DataFrame({'Segment': body.iloc[:, label_pos].tolist()})
+        for header, pos in zip(headers, value_positions):
+            rebuilt[header] = body.iloc[:, pos].tolist()
+        return rebuilt
+
+    def _accept_strong_anchor_tables(soup, fallback_context=''):
+        """Parse a governing wrapper table even when SEC nests leaf tables.
+
+        The normal scan deliberately skips layout wrappers.  A small number of
+        high-confidence disclosures put the heading outside a wrapper whose leaf
+        tables separately contain labels, currency decorators and values.  The
+        heading-to-next-table relationship safely reconstructs the complete grid.
+        """
+        seen_tags = set()
+        try:
+            strings = soup.find_all(string=lambda value: bool(
+                value and _strong_table_anchor_re.search(_gb_clean_text(value))))
+        except Exception:
+            strings = []
+        for node in strings:
+            anchor_text = _gb_clean_text(node)
+            parent_table = node.find_parent('table') if hasattr(node, 'find_parent') else None
+            table_tag = parent_table or (node.find_next('table') if hasattr(node, 'find_next') else None)
+            if table_tag is None:
+                continue
+            tag_key = id(table_tag)
+            if tag_key in seen_tags:
+                continue
+            seen_tags.add(tag_key)
+            context = _gb_clean_text(
+                f'{anchor_text} {_gb_nearby_table_context(table_tag)} {fallback_context[:600]}')
+            try:
+                parsed_tables = pd.read_html(StringIO(str(table_tag)))
+            except Exception:
+                continue
+            reconstructed = _reconstruct_segment_asset_anchor_grid(
+                parsed_tables, anchor_text)
+            if reconstructed is not None:
+                _accept_table_safely(reconstructed, context)
+            for parsed in parsed_tables[:6]:
+                _accept_table_safely(parsed, context)
 
     for raw_value in text_blocks['value'].to_numpy(copy=False):
         html_text = str(raw_value or '')
@@ -7091,7 +8642,15 @@ def _extract_generic_business_breakdowns_from_textblocks(
             soup = BeautifulSoup(html_text, 'html.parser')
         except Exception:
             continue
+        _accept_strong_anchor_tables(soup, plain_preview)
         for table_tag in soup.find_all('table'):
+            # SEC filings frequently nest actual data tables inside outer
+            # layout tables.  Parsing the outer wrapper flattens unrelated
+            # P&L, balance-sheet, cash-flow and note tables into one grid -- the
+            # direct cause of the 70-row Google and 20-row Palantir explosions.
+            # Every inner leaf table is visited separately, so skip wrappers.
+            if table_tag.find('table') is not None:
+                continue
             context = _gb_nearby_table_context(table_tag)
             if not context:
                 context = plain_preview[:1800]
@@ -7100,7 +8659,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
             except Exception:
                 continue
             for table in parsed_tables[:1]:
-                _accept_table(table, context)
+                _accept_table_safely(table, context)
 
     # Inline-XBRL presentation tables can live directly in the filing HTML
     # without being wrapped by an XBRL TextBlock fact.  Scan only tables whose
@@ -7111,7 +8670,10 @@ def _extract_generic_business_breakdowns_from_textblocks(
             filing_soup = BeautifulSoup(fetch_html(filing), 'html.parser')
             for hidden in filing_soup.find_all(style=_DISPLAY_NONE_RE):
                 hidden.decompose()
+            _accept_strong_anchor_tables(filing_soup)
             for table_tag in filing_soup.find_all('table'):
+                if table_tag.find('table') is not None:
+                    continue
                 context = _gb_nearby_table_context(table_tag)
                 if not _gb_has_positive_context(context):
                     continue
@@ -7120,7 +8682,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 except Exception:
                     continue
                 for table in parsed_tables[:1]:
-                    _accept_table(table, context)
+                    _accept_table_safely(table, context)
         except Exception as filing_html_error:
             _debug_print(
                 f"  [Business Table] Full filing HTML scan skipped "
@@ -7182,6 +8744,7 @@ def _gb_strip_trailing_footnote_marker(label: str) -> str:
     while text and text != previous:
         previous = text
         text = marker.sub('', text).strip()
+    text = re.sub(r'(?<=[A-Za-z])\s+[1-9]$', '', text).strip()
     return text
 
 
@@ -7634,14 +9197,27 @@ def _gb_consolidate_operating_metric_aliases(df: pd.DataFrame) -> pd.DataFrame:
                 decision = 'REJECTED'
                 reason = 'insufficient_independent_overlap'
                 approved = False
-                if evidence['conflicts']:
+                if relation == 'gain_loss_alternation':
+                    # Gain/loss captions are sign-dependent names for the same
+                    # net-change measure.  Comparative filing parses can overlap
+                    # in one restated period; one bounded conflict must not split
+                    # the entire lineage when multiple periods match.  Once the
+                    # labels are unified, normal source arbitration selects the
+                    # preferred fact for the conflicting period.
+                    approved = (
+                        evidence['overlap'] == 0
+                        or evidence['matching'] >= 1
+                        or (evidence['overlap'] >= 2
+                            and evidence['conflicts'] <= 1)
+                    )
+                    reason = ('gain_loss_semantic_lineage'
+                              if approved else 'conflicting_reported_overlap')
+                elif evidence['conflicts']:
                     reason = 'conflicting_reported_overlap'
                 elif evidence['same_source_table']:
                     reason = 'distinct_rows_coexist_in_same_source_table'
                 elif relation in {'restrictive_modifier_conflict', 'scope_expansion'}:
                     reason = relation
-                elif relation == 'gain_loss_alternation':
-                    approved = True
                 elif relation in {'declared_acronym', 'explanatory_qualifier', 'lexical_identity'}:
                     approved = evidence['matching'] >= 1 and evidence['distinct'] >= 1
                 elif relation == 'participant_synonym':
@@ -7719,10 +9295,21 @@ def _gb_consolidate_operating_metric_aliases(df: pd.DataFrame) -> pd.DataFrame:
                 if not compatible_pairs:
                     blocked = True
                     break
-                if any(_gb_operating_alias_pair_evidence(lp, rp)['conflicts']
-                       for lp, rp in compatible_pairs):
-                    blocked = True
-                    break
+                _cross_evidence = [
+                    _gb_operating_alias_pair_evidence(lp, rp)
+                    for lp, rp in compatible_pairs]
+                if any(ev['conflicts'] for ev in _cross_evidence):
+                    pair_relation = _gb_operating_alias_relation(
+                        left_label, right_label, acronyms)
+                    # A pure gain/loss lineage may carry one comparative
+                    # restatement conflict; candidate arbitration resolves it
+                    # after canonicalization.  All other alias families remain
+                    # strictly conflict-free.
+                    if not (pair_relation == 'gain_loss_alternation'
+                            and sum(ev['conflicts'] for ev in _cross_evidence) <= 1
+                            and sum(ev['matching'] for ev in _cross_evidence) >= 1):
+                        blocked = True
+                        break
             if blocked:
                 break
         if blocked:
@@ -7771,6 +9358,7 @@ def _gb_consolidate_operating_metric_aliases(df: pd.DataFrame) -> pd.DataFrame:
         }))
         max_overlap = max((edge['evidence']['matching'] for edge in cluster_edges), default=0)
         max_exact = max((edge['evidence']['exact'] for edge in cluster_edges), default=0)
+        max_conflicts = max((edge['evidence']['conflicts'] for edge in cluster_edges), default=0)
         component_idx = component_rows.index
         out.loc[component_idx, 'SourceAliasVerified'] = True
         out.loc[component_idx, 'SourceAliasGroupId'] = group_id
@@ -7779,7 +9367,7 @@ def _gb_consolidate_operating_metric_aliases(df: pd.DataFrame) -> pd.DataFrame:
         out.loc[component_idx, 'SourceAliasEvidence'] = evidence_text
         out.loc[component_idx, 'SourceAliasOverlapPeriods'] = max_overlap
         out.loc[component_idx, 'SourceAliasExactPeriods'] = max_exact
-        out.loc[component_idx, 'SourceAliasConflictPeriods'] = 0
+        out.loc[component_idx, 'SourceAliasConflictPeriods'] = max_conflicts
         if 'SourceSemanticVerified' in out.columns:
             out.loc[component_idx, 'SourceSemanticVerified'] = True
         if 'SourceTrustScore' in out.columns:
@@ -7867,7 +9455,19 @@ def _gb_prepare_operating_measure_facts(df: pd.DataFrame) -> pd.DataFrame:
             roles = set(table_group.get(
                 'SourceTableRole', pd.Series('', index=table_group.index)
             ).fillna('').astype(str))
-            if roles & {'rollforward', 'snapshot'}:
+            geometries = set(table_group.get(
+                'SourceTableGeometry', pd.Series('', index=table_group.index)
+            ).fillna('').astype(str))
+            bases = set(table_group.get(
+                'SourcePeriodBasis', pd.Series('', index=table_group.index)
+            ).fillna('').astype(str))
+            # ``rollforward``/``snapshot`` is stored in SourceTableGeometry,
+            # not SourceTableRole.  v60 checked the wrong column and therefore
+            # rejected Robinhood's ending balance and composition rows as if
+            # they were a noisy activity table.  Period-basis evidence is a
+            # second guard for old cached facts that predate geometry metadata.
+            if (geometries & {'rollforward', 'snapshot'}
+                    or bases & {_GB_BASIS_INSTANT_START, _GB_BASIS_INSTANT_END}):
                 continue
             source_labels = table_group.get(
                 'SourceLabel', table_group['Label']).fillna('').astype(str)
@@ -8108,7 +9708,14 @@ def _gb_fact_audit_from_selected_rows(final_df: pd.DataFrame, ticker: str) -> pd
         'SourceRollforwardErrorPct', 'SourceDerivation', 'SourcePeriodBasis',
         'SourcePeriodRole', 'SourceUnitKind', 'SourceUnitScale',
         'SourceUnitSignature', 'SourceUnitEvidence', 'SourceUnitConfidence',
-        'SourceDisplayDecimals', 'SourceRawValue', 'Concept', 'FY', 'Q',
+        'SourceDisplayDecimals', 'SourceRawValue',
+        'SourceKind', 'SourceAdmissionRule', 'SourceSemanticType',
+        'SourceAnalyticalBasis', 'SourceDirectness',
+        'SourceClassificationConfidence', 'SourceDimensionAxes',
+        'SourceDimensionMembers', 'SourceAxisSignature',
+        'SourceMemberSignature', 'SourceAxisSemantic', 'SourceTableGeometry',
+        'SourceAssetMetricKind',
+        'Concept', 'FY', 'Q',
         'Start', 'End', 'Duration', 'DimensionSignature', 'DimCount', 'Form',
         'Filed', 'Accession', 'FilingUrl', 'SourceTableFingerprint',
         'SourceLabel', 'SourceValueHeader', 'SourceTableRole',
@@ -8242,14 +9849,19 @@ def _gb_reconcile_operating_metric_identities(df: pd.DataFrame) -> pd.DataFrame:
     return _gb_consolidate_operating_metric_aliases(df)
 
 
-def _gb_group_operating_period_basis(group: pd.DataFrame):
-    """Resolve one high-confidence basis for an HTML operating series."""
-    required = {'Concept', 'SourcePrefix', 'SourcePeriodBasis'}
+def _gb_group_period_basis(group: pd.DataFrame):
+    """Resolve one high-confidence period basis for any source-bound series.
+
+    v59 limited this to ``Operating Measure`` rows, so HTML segment assets lost
+    their ``instant_end`` semantics before quarterly derivation.  The generic
+    resolver honors provenance for every HTML table role while retaining the
+    same fail-closed conflict rules.
+    """
+    required = {'Concept', 'SourcePeriodBasis'}
     if group is None or group.empty or not required.issubset(group.columns):
         return None
     subset = group[
         group['Concept'].eq(_HTML_BUSINESS_CONCEPT)
-        & group['SourcePrefix'].eq('Operating Measure')
         & group['SourcePeriodBasis'].notna()
     ].copy()
     if subset.empty:
@@ -8272,11 +9884,14 @@ def _gb_group_operating_period_basis(group: pd.DataFrame):
         return top_basis if top_conf >= 0.80 else _GB_BASIS_UNKNOWN
     second_count = int(summary.iloc[1]['count'])
     second_conf = float(summary.iloc[1]['confidence'])
-    # Explicit high-confidence evidence may resolve a minority low-confidence
-    # conflict; otherwise fail closed and keep direct quarterly facts only.
     if top_conf >= 0.97 and (top_count > second_count or top_conf - second_conf >= 0.15):
         return top_basis
     return _GB_BASIS_UNKNOWN
+
+
+# Backward-compatible name used by older tests/callers.
+def _gb_group_operating_period_basis(group: pd.DataFrame):
+    return _gb_group_period_basis(group)
 
 
 def _gb_group_metric_family(group: pd.DataFrame):
@@ -8350,7 +9965,11 @@ def _gb_clean_member_footnote(member: str) -> str:
     # SEC table footnote markers are often flattened into labels as a trailing
     # digit ("International1").  Strip only digits attached to a word; retain
     # legitimate standalone numbered business names.
-    return re.sub(r'(?<=[A-Za-z])\d+$', '', text).strip()
+    text = re.sub(r'(?<=[A-Za-z])\d+$', '', text).strip()
+    # Alphabetic SEC footnote markers are presentation syntax when attached to
+    # a segment/member caption (for example, ``China (a)``).  This member-only
+    # cleanup does not affect legitimate labels such as Class A.
+    return re.sub(r'\s*\([a-z]\)\s*$', '', text, flags=re.I).strip()
 
 
 def _gb_normalized_display_parts(label: str):
@@ -8362,7 +9981,9 @@ def _gb_normalized_display_parts(label: str):
 def _gb_route_html_business_fact(fact: dict) -> dict:
     """Route proven geographic HTML revenue members before segment cleanup."""
     routed = dict(fact)
-    if routed.get('SourcePrefix') == 'Operating Measure':
+    if (routed.get('Category') == OPERATING_METRICS_CATEGORY
+            or routed.get('SourcePrefix') == 'Operating Measure'
+            or routed.get('SourceTableRole') == _GB_ROLE_OPERATING_METRIC):
         routed['Category'] = OPERATING_METRICS_CATEGORY
         routed['Label'] = _gb_strip_trailing_footnote_marker(routed.get('Label'))
         routed['SourceMetricFamily'] = _gb_operating_metric_family(
@@ -8372,7 +9993,14 @@ def _gb_route_html_business_fact(fact: dict) -> dict:
     member = _gb_clean_member_footnote(member)
     if not member or _normalize_label_key(metric) != 'revenue':
         return routed
-    geo_kind = _classify_geographic_member(member, False)
+    # The table's accounting role outranks a geographic-looking member name.
+    # North America/International can be reportable business segments; route
+    # them geographically only when the source table itself proved a geographic
+    # basis.
+    if (routed.get('SourceTableRole') != _GB_ROLE_GEOGRAPHIC_REVENUE
+            and not routed.get('SourceGeographicBasis')):
+        return routed
+    geo_kind = _classify_geographic_member(member, True)
     if geo_kind is None:
         return routed
     member = _canonical_geographic_member_label(member, False)
@@ -8383,6 +10011,80 @@ def _gb_route_html_business_fact(fact: dict) -> dict:
     )
     routed['Label'] = f'{metric} - {member}'
     return routed
+
+
+def _gb_promote_proven_segment_disclosure_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Restore older periods of a segment series after taxonomy-axis changes.
+
+    Some filers change custom axis names while retaining the same member label
+    and metric.  Conservative axis admission can then place early periods in
+    disclosures while later periods are correctly classified as 4a.  Promote
+    only an exact-label lineage with substantial modern segment evidence and no
+    high-risk disclosure axis.  Values are never copied or derived.
+    """
+    required = {'Category', 'Label', 'FY', 'Q'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    allowed_metrics = {
+        'revenue', 'operating income', 'contribution', 'segment profit',
+        'expenses attributable to segment', 'other segment item', 'assets',
+    }
+    segment = out[out['Category'].eq('4a_Segments_Business')]
+    disclosures = out[out['Category'].eq('6_Disclosures')]
+    if segment.empty or disclosures.empty:
+        return out
+    promoted = 0
+    for label, seg_rows in segment.groupby('Label', sort=False):
+        metric = _normalize_label_key(_split_segment_display_label(label)[0])
+        if metric not in allowed_metrics:
+            continue
+        seg_periods = {(r.FY, str(r.Q)) for r in seg_rows.itertuples()
+                       if pd.notna(r.FY) and pd.notna(r.Q)}
+        if len(seg_periods) < 4:
+            continue
+        old_rows = disclosures[disclosures['Label'].eq(label)]
+        if len(old_rows) < 2:
+            continue
+        axes = old_rows.get(
+            'SourceDimensionAxes', pd.Series('', index=old_rows.index)
+        ).fillna('').astype(str).str.casefold()
+        # Filter unsafe disclosure axes row by row.  One fair-value or
+        # acquisition fact must not veto a separate, exact-label segment
+        # lineage from a benign custom axis in the same historical period set.
+        safe_axis = ~axes.str.contains(
+            r'fairvalue|securit|derivative|hedg|(?:^|[:_])tax|incometax|'
+            r'deferredtax|taxbenefit|taxexpense|acquisition|intangible|'
+            r'lease|debt|cashflow|maturity|creditquality', regex=True)
+        eligible_rows = old_rows.loc[safe_axis].copy()
+        if len(eligible_rows) < 2:
+            continue
+        roles = eligible_rows.get(
+            'SourceTableRole', pd.Series('', index=eligible_rows.index)
+        ).fillna('').astype(str)
+        kinds = eligible_rows.get(
+            'SourceKind', pd.Series('', index=eligible_rows.index)
+        ).fillna('').astype(str)
+        # Exact-label continuity must still come from dimensional XBRL or a
+        # proven reportable-segment table, not a generic disclosure table.
+        valid_source = (
+            roles.eq('xbrl_dimensional_fact')
+            | roles.eq(_GB_ROLE_REPORTABLE_SEGMENT_PNL)
+            | kinds.eq('xbrl')
+        )
+        if not valid_source.all():
+            continue
+        out.loc[eligible_rows.index, 'Category'] = '4a_Segments_Business'
+        if 'SourceAdmissionRule' in out.columns:
+            out.loc[eligible_rows.index, 'SourceAdmissionRule'] = (
+                'exact_label_segment_history_continuity')
+        if 'SourceAnalyticalBasis' in out.columns:
+            out.loc[eligible_rows.index, 'SourceAnalyticalBasis'] = 'business_segment'
+        promoted += len(eligible_rows)
+    if promoted:
+        print(f"  [Segment Continuity] Restored {promoted} older segment fact(s) "
+              "from exact-label taxonomy continuity.")
+    return out
 
 
 def _normalize_extracted_geographic_facts(extracted):
@@ -8406,6 +10108,14 @@ def _normalize_extracted_geographic_facts(extracted):
         if _normalize_label_key(metric) != 'revenue' or not member:
             continue
         source_basis = str(fact.get('SourceGeographicBasis') or '').strip()
+        table_role = str(fact.get('SourceTableRole') or '')
+        if (fact.get('Category') == '4a_Segments_Business'
+                and table_role in {
+                    _GB_ROLE_REPORTABLE_SEGMENT_PNL,
+                    _GB_ROLE_REVENUE_DISAGG,
+                }
+                and not source_basis):
+            continue
         axis_hint = fact.get('Category') in {
             '4b_Segments_Geographic_Regions',
             '4c_Segments_Geographic_Countries',
@@ -8677,10 +10387,14 @@ def _reconcile_html_business_breakdown_facts(all_facts):
             numeric_value = round(float(fact.get('Value')), 6)
         except (TypeError, ValueError):
             numeric_value = None
+        source_cell_identity = str(fact.get('SourceCellIdentity') or '').strip()
         source_identity = (
-            fact.get('Accession'), fact.get('SourceTableFingerprint') or '',
-            member_key, _gb_fact_period_key(fact), numeric_value,
-            _normalize_label_key(fact.get('SourceValueHeader') or ''),
+            ('source_cell', source_cell_identity)
+            if source_cell_identity else (
+                fact.get('Accession'), fact.get('SourceTableFingerprint') or '',
+                member_key, _gb_fact_period_key(fact), numeric_value,
+                _normalize_label_key(fact.get('SourceValueHeader') or ''),
+            )
         )
         conflict_groups[source_identity].append((position, metric_key))
 
@@ -8792,6 +10506,336 @@ def _reconcile_html_business_breakdown_facts(all_facts):
         )
     return passthrough + kept_html
 
+
+
+def _gb_recover_atomic_dimensional_segment_asset_groups(
+        facts_df: pd.DataFrame, existing_facts, ye_month: int, filed,
+        member_labeler=None, filing_url=None):
+    """Recover complete instant segment-asset groups from dimensional XBRL.
+
+    Some inline-XBRL filings model operating segments through a container
+    member (for example ``Operating Segments``) on one business axis and the
+    actual participant on a second business axis.  A corporate/reconciliation
+    participant may then use only the first axis.  Row-by-row classification can
+    retain the corporate fact while losing the operating participants.
+
+    This recovery is deliberately fail-closed and source-structural:
+      * direct instant facts only;
+      * an asset-balance concept, never capex/PPE/additions;
+      * at least three participant members connected through overlapping
+        segment/business axes;
+      * the participant values must reconcile to an undimensioned consolidated
+        fact for the same concept and date;
+      * the same member group must be proven on at least two instant dates.
+
+    No ticker, company name, participant name, or expected numeric value is
+    used.  Existing facts are replaced only for the exact proven member-period
+    cells, making the operation idempotent.
+    """
+    required = {'concept', 'value'}
+    if facts_df is None or facts_df.empty or not required.issubset(facts_df.columns):
+        return list(existing_facts or []), []
+    dim_cols = [c for c in facts_df.columns if str(c).startswith('dim_')]
+    if not dim_cols:
+        return list(existing_facts or []), []
+
+    work = facts_df.copy()
+    if '_end_dt' in work.columns:
+        work['_GBEnd'] = pd.to_datetime(work['_end_dt'], errors='coerce')
+    else:
+        raw_end = work.get('period_end', pd.Series(pd.NaT, index=work.index))
+        if 'period_instant' in work.columns:
+            raw_end = raw_end.where(raw_end.notna(), work['period_instant'])
+        work['_GBEnd'] = pd.to_datetime(raw_end, errors='coerce')
+    if '_start_dt' in work.columns:
+        work['_GBStart'] = pd.to_datetime(work['_start_dt'], errors='coerce')
+    elif 'period_start' in work.columns:
+        work['_GBStart'] = pd.to_datetime(work['period_start'], errors='coerce')
+    else:
+        work['_GBStart'] = pd.NaT
+    work['_GBConcept'] = work['concept'].astype(str).str.rsplit(':', n=1).str[-1]
+    work['_GBValue'] = pd.to_numeric(work['value'], errors='coerce')
+    work = work[work['_GBEnd'].notna() & work['_GBStart'].isna()
+                & work['_GBValue'].notna() & work['_GBValue'].ge(0)].copy()
+    if work.empty:
+        return list(existing_facts or []), []
+
+    balance_concepts = {
+        concept for concept in work['_GBConcept'].dropna().astype(str).unique()
+        if _gb_segment_asset_concept_kind(concept, 0) == 'balance'
+    }
+    if not balance_concepts:
+        return list(existing_facts or []), []
+    work = work[work['_GBConcept'].isin(balance_concepts)].copy()
+    if work.empty:
+        return list(existing_facts or []), []
+
+    role_by_axis = {axis: _dimension_axis_role_flags(axis) for axis in dim_cols}
+    categorical_noise = {
+        _normalize_label_key(value) for value in {
+            'operating segments', 'reportable segments', 'business segments',
+            'segment', 'segments', 'reportable', 'operating', 'consolidated',
+            'consolidated entities', 'total', 'all segments', 'eliminations',
+            'intersegment eliminations', 'adjustments',
+        }
+    }
+
+    def _label_member(raw):
+        try:
+            text = member_labeler(raw) if member_labeler else None
+        except Exception:
+            text = None
+        if not text:
+            text = _normalize_member_label(clean_name(str(raw or '')))
+        text = _gb_clean_member_footnote(str(text or '')).strip()
+        text = re.sub(r'\s+(?:non|nonsegment)$', '', text, flags=re.I).strip()
+        return text
+
+    def _canonical_from_existing(member):
+        related = []
+        probe = f'Assets - {member}'
+        for fact in existing_facts or ():
+            _metric, candidate = _split_segment_display_label(
+                str(fact.get('Label') or ''))
+            if not candidate:
+                continue
+            candidate = _gb_clean_member_footnote(candidate).strip()
+            if _gb_duplicate_members_related(probe, f'Assets - {candidate}'):
+                related.append(candidate)
+        if not related:
+            return member
+        # Prefer a concise source-used acronym when one exists; otherwise use
+        # the clean shortest label.  This is generic alias selection, not a
+        # participant registry.
+        related = list(dict.fromkeys(related))
+        acronyms = [x for x in related if re.fullmatch(r'[A-Z0-9]{2,8}', x)]
+        if acronyms:
+            return sorted(acronyms, key=lambda x: (len(x), x))[0]
+        return sorted(related, key=lambda x: (len(x), x.casefold()))[0]
+
+    rows = []
+    for idx, row in work.iterrows():
+        active = [axis for axis in dim_cols if pd.notna(row.get(axis))]
+        if not active:
+            continue
+        segment_axes = {
+            axis for axis in active
+            if role_by_axis[axis].get('business')
+            or any(token in str(axis).casefold()
+                   for token in ('segment', 'businessunit', 'businessline'))
+        }
+        if not segment_axes:
+            continue
+        members = []
+        for axis in active:
+            if axis not in segment_axes:
+                continue
+            member = _label_member(row.get(axis))
+            key = _normalize_label_key(member)
+            if not member or key in categorical_noise:
+                continue
+            if _GB_UNSAFE_SEGMENT_ASSET_MEMBER_RE.search(member):
+                continue
+            if key not in {_normalize_label_key(x) for x in members}:
+                members.append(member)
+        if len(members) != 1:
+            # A complete segment-asset cell identifies one participant after
+            # container/domain members are removed.  Multi-part accounting
+            # overlays fail closed.
+            continue
+        rows.append({
+            'index': idx,
+            'concept': str(row['_GBConcept']),
+            'end': pd.Timestamp(row['_GBEnd']).normalize(),
+            'value': float(row['_GBValue']),
+            'member': _canonical_from_existing(members[0]),
+            'axes': frozenset(segment_axes),
+            'dim_count': len(active),
+            'is_calculated': bool(row.get('is_calculated', False)),
+        })
+    if not rows:
+        return list(existing_facts or []), []
+
+    candidates = pd.DataFrame(rows)
+    recovered_groups = []
+    # Undimensioned facts provide the accounting identity proving completeness.
+    no_dims = work[dim_cols].isna().all(axis=1)
+    consolidated = work.loc[no_dims, ['_GBConcept', '_GBEnd', '_GBValue']].copy()
+    consolidated['_GBEnd'] = pd.to_datetime(consolidated['_GBEnd']).dt.normalize()
+
+    for (concept, end), period_rows in candidates.groupby(
+            ['concept', 'end'], sort=False):
+        total_values = pd.to_numeric(
+            consolidated.loc[
+                consolidated['_GBConcept'].eq(concept)
+                & consolidated['_GBEnd'].eq(end), '_GBValue'],
+            errors='coerce').dropna().tolist()
+        if not total_values:
+            continue
+        entries = period_rows.to_dict('records')
+        # Connected components by overlapping segment/business axes allow a
+        # corporate member on a parent axis to join operating members that also
+        # carry a child participant axis.
+        unseen = set(range(len(entries)))
+        components = []
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            frontier = [seed]
+            while frontier:
+                current = frontier.pop()
+                linked = [j for j in list(unseen)
+                          if entries[current]['axes'] & entries[j]['axes']]
+                for j in linked:
+                    unseen.remove(j)
+                    component.add(j)
+                    frontier.append(j)
+            components.append([entries[j] for j in sorted(component)])
+
+        for component in components:
+            by_member = {}
+            for item in component:
+                key = _normalize_label_key(item['member'])
+                incumbent = by_member.get(key)
+                score = (not item['is_calculated'], -item['dim_count'])
+                if incumbent is None or score > incumbent[0]:
+                    by_member[key] = (score, item)
+            component = [item for _, item in by_member.values()]
+            if len(component) < 3:
+                continue
+            component_sum = sum(float(item['value']) for item in component)
+            matched_total = next((float(total) for total in total_values
+                                  if abs(component_sum - float(total))
+                                  <= max(5_000_000.0, abs(float(total)) * 0.001)),
+                                 None)
+            if matched_total is None:
+                continue
+            recovered_groups.append({
+                'concept': concept, 'end': end, 'rows': component,
+                'members': frozenset(_normalize_label_key(item['member'])
+                                     for item in component),
+                'axes': frozenset().union(*(item['axes'] for item in component)),
+                'total': matched_total,
+            })
+
+    if len(recovered_groups) < 2:
+        return list(existing_facts or []), []
+
+    accepted = []
+    for group in recovered_groups:
+        peers = [other for other in recovered_groups if other is not group
+                 and other['concept'] == group['concept']
+                 and len(group['members'] & other['members']) >= 3
+                 and len(group['members'] & other['members'])
+                    / max(len(group['members'] | other['members']), 1) >= 0.75]
+        if peers:
+            accepted.append(group)
+    if not accepted:
+        return list(existing_facts or []), []
+
+    # Keep only member identities repeated across at least two accepted dates.
+    member_frequency = defaultdict(int)
+    for group in accepted:
+        for member in group['members']:
+            member_frequency[member] += 1
+    stable_members = {member for member, count in member_frequency.items()
+                      if count >= 2}
+    accepted = [group for group in accepted
+                if len(group['members'] & stable_members) >= 3]
+    if not accepted:
+        return list(existing_facts or []), []
+
+    recovered = []
+    recovered_keys = set()
+    for group in accepted:
+        member_set = sorted(group['members'] & stable_members)
+        fingerprint_payload = '|'.join([
+            group['concept'], ','.join(sorted(group['axes'])),
+            ','.join(member_set),
+        ])
+        fingerprint = 'xbrl-atomic-segment-assets-' + hashlib.sha1(
+            fingerprint_payload.encode('utf-8')).hexdigest()[:16]
+        fy, q = get_period_info(group['end'], ye_month)
+        for item in group['rows']:
+            member_key = _normalize_label_key(item['member'])
+            if member_key not in stable_members:
+                continue
+            member = item['member']
+            end_text = pd.Timestamp(group['end']).strftime('%Y-%m-%d')
+            fact = {
+                'Category': '4a_Segments_Business',
+                'Label': f'Assets - {member}',
+                'Value': item['value'],
+                'FY': int(fy), 'Q': str(q), 'End': end_text,
+                'Start': None, 'Duration': 0, 'Filed': filed,
+                'TagRank': 0, 'DimCount': int(item['dim_count']),
+                'IsCalculated': bool(item['is_calculated']),
+                'Concept': group['concept'], 'FilingUrl': filing_url,
+                'SourceKind': 'xbrl_atomic_group',
+                'SourceAdmissionRule': 'atomic_dimensional_segment_assets_reconciliation',
+                'SourceSemanticType': 'Assets',
+                'SourceAnalyticalBasis': 'business_segment',
+                'SourceDirectness': 'reported',
+                'SourceClassificationConfidence': 1.0,
+                'SourceTableRole': _GB_ROLE_SEGMENT_ASSETS,
+                'SourceDimensionAxes': ' | '.join(sorted(group['axes'])),
+                'SourceDimensionMembers': member,
+                'SourceAxisSignature': ' | '.join(sorted(group['axes'])),
+                'SourceMemberSignature': member,
+                'SourceAxisSemantic': 'business',
+                'SourcePeriodBasis': _GB_BASIS_INSTANT_END,
+                'SourceBasisConfidence': 1.0,
+                'SourceAssetMetricKind': 'balance',
+                'SourceMetricIdentity': 'ending_segment_assets',
+                'SourceTableFingerprint': fingerprint,
+            }
+            recovered.append(fact)
+            recovered_keys.add((int(fy), str(q), end_text, member_key))
+
+    if not recovered:
+        return list(existing_facts or []), []
+
+    def _safe_fact_fy(value):
+        try:
+            if value is None or pd.isna(value):
+                return None
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    kept = []
+    removed = 0
+    for fact in existing_facts or ():
+        metric, member = _split_segment_display_label(str(fact.get('Label') or ''))
+        if _normalize_label_key(metric) != 'asset' or not member:
+            kept.append(fact)
+            continue
+        end_text = str(fact.get('End') or '')[:10]
+        key = (_safe_fact_fy(fact.get('FY')),
+               str(fact.get('Q')), end_text,
+               _normalize_label_key(_gb_clean_member_footnote(member)))
+        if key in recovered_keys:
+            removed += 1
+            continue
+        # Also remove acronym/expanded aliases for an exact recovered period.
+        alias_hit = any(
+            key[:3] == (
+                _safe_fact_fy(next_fact.get('FY')),
+                str(next_fact.get('Q')),
+                str(next_fact.get('End') or '')[:10],
+            )
+            and _gb_duplicate_members_related(
+                f'Assets - {member}', str(next_fact.get('Label') or ''))
+            for next_fact in recovered)
+        if alias_hit:
+            removed += 1
+            continue
+        kept.append(fact)
+    kept.extend(recovered)
+    if recovered:
+        print(f'  [Asset Group] Recovered {len(recovered)} direct instant '
+              f'segment-asset cell(s); replaced {removed} isolated candidate(s).')
+    return kept, recovered
 
 def extract_from_filing(filing, ye_month, ticker=None, use_arelle=False):
     with _ProfileTimer("extract_from_filing_total"):
@@ -8956,23 +11000,8 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                          'SellingGeneral', 'ResearchAndDevelopment', 'PurchasesOf',
                          'PurchaseOf', 'PaymentsFor', 'PaymentsOf', 'AcquisitionsOf',
                          'PropertyPlantAndEquipmentAdditions')
-    _norm_business_axes = {ax.replace(':', '_') for ax in BUSINESS_SEGMENT_AXES}
-    _norm_geographic_axes = {ax.replace(':', '_') for ax in GEOGRAPHIC_SEGMENT_AXES}
-    _consolidation_axis_norm = CONSOLIDATION_AXIS.replace(':', '_')
     _dim_col_roles = {
-        _c: {
-            'business': any(ax in _c for ax in _norm_business_axes),
-            'geographic': any(ax in _c for ax in _norm_geographic_axes),
-            'product': 'ProductOrServiceAxis' in _c,
-            'reconciliation': _consolidation_axis_norm in _c,
-            'equity_component': any(ax in _c for ax in EQUITY_COMPONENT_AXES),
-            'supplemental_axis': (
-                'Supplemental' in _c
-                or 'Proforma' in _c
-                or 'NonGAAP' in _c
-                or 'AdjustmentsFor' in _c
-            ),
-        }
+        _c: _dimension_axis_role_flags(_c)
         for _c in dim_cols
     }
     _categorical_noise = {'geographic concentration risk', 'concentration risk',
@@ -9029,6 +11058,80 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             m_clean = _normalize_member_label(clean_name(member_tag))
         _member_label_cache[key] = m_clean
         return m_clean
+
+    # Some filers use StatementBusinessSegmentsAxis for geographic reportable
+    # segments (Apple), while others use the same axis for named businesses that
+    # happen to include geographic words (Amazon: North America, International,
+    # AWS).  Infer the axis role from its complete member set instead of letting
+    # one member name or the generic axis name decide every fact independently.
+    _business_axis_semantics = {}
+    _business_axis_mixed_geography = {}
+    for _dim_col in dim_cols:
+        if not _dim_col_roles[_dim_col]['business']:
+            continue
+        _axis_members = []
+        try:
+            _raw_members = facts_df[_dim_col].dropna().astype(str).drop_duplicates().head(250)
+        except Exception:
+            _raw_members = []
+        for _member_tag in _raw_members:
+            _member_label = _clean_member_tag(_member_tag)
+            _member_key = _member_label.casefold().strip()
+            if (not _member_key or _member_key in _categorical_noise
+                    or _member_key in {'consolidated', 'total', 'all segments',
+                                       'eliminations', 'corporate and other'}):
+                continue
+            _axis_members.append(_member_label)
+        _business_axis_semantics[_dim_col] = (
+            _infer_business_axis_semantic(_axis_members))
+        _geo_flags = [bool(_is_pure_geographic_label(member, False))
+                      for member in _axis_members]
+        _business_axis_mixed_geography[_dim_col] = bool(
+            any(_geo_flags) and any(not flag for flag in _geo_flags))
+
+    _concept_axis_semantics = {}
+    _concept_axis_raw_members = {}
+    for _dim_col in _business_axis_semantics:
+        try:
+            _pairs = facts_df.loc[
+                facts_df[_dim_col].notna(), ['_concept_short', _dim_col]]
+            _concept_axis_raw_members[_dim_col] = {
+                str(_concept): list(dict.fromkeys(
+                    group[_dim_col].astype(str).tolist()))[:100]
+                for _concept, group in _pairs.groupby('_concept_short', sort=False)
+            }
+        except Exception:
+            _concept_axis_raw_members[_dim_col] = {}
+
+    def _concept_business_axis_semantic(concept_name, dim_col):
+        cache_key = (str(concept_name), str(dim_col))
+        cached = _concept_axis_semantics.get(cache_key)
+        if cached is not None:
+            return cached
+        axis_semantic = _business_axis_semantics.get(dim_col, 'business')
+        # The complete axis/member set is stronger evidence than one concept's
+        # sparse subset.  Amazon's revenue concept may expose only North
+        # America and International while AWS is carried by another concept;
+        # classifying that subset alone as geography splits one reportable
+        # segment basis.  Conversely an all-geographic Apple axis remains
+        # geographic because its complete member set proves that role.
+        if axis_semantic == 'business':
+            _concept_axis_semantics[cache_key] = 'business'
+            return 'business'
+        labels = []
+        raw_members = _concept_axis_raw_members.get(dim_col, {}).get(
+            str(concept_name), ())
+        for member_tag in raw_members:
+            member_label = _clean_member_tag(member_tag)
+            member_key = member_label.casefold().strip()
+            if (not member_key or member_key in _categorical_noise
+                    or member_key in {'consolidated', 'total', 'all segments',
+                                      'eliminations', 'corporate and other'}):
+                continue
+            labels.append(member_label)
+        semantic = _gb_resolve_concept_axis_semantic(axis_semantic, labels)
+        _concept_axis_semantics[cache_key] = semantic
+        return semantic
 
     _column_positions = {name: pos for pos, name in enumerate(facts_df.columns)}
     _dim_col_positions = tuple((c, _column_positions[c]) for c in dim_cols)
@@ -9115,12 +11218,34 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                     'Filed': _filing_date_raw, 'TagRank': rank,
                     'DimCount': 0, 'IsCalculated': is_calculated, 'Concept': concept,
-                    'FilingUrl': _get_filing_url_once()
+                    'FilingUrl': _get_filing_url_once(),
+                    'SourceKind': 'xbrl',
+                    'SourceAdmissionRule': 'consolidated_concept_map',
+                    'SourceSemanticType': target_label,
+                    'SourceAnalyticalBasis': 'consolidated_statement',
+                    'SourceDirectness': ('calculation_linkbase' if is_calculated else 'reported'),
+                    'SourceClassificationConfidence': 1.0,
+                    'SourceTableRole': 'xbrl_statement_fact',
                 })
                 captured_by_concept_map = True
 
         # 2. Check for Segment/Dimensional Breakdowns
         matched_prefix = _matched_segment_prefix(concept, c_lower)
+        _asset_candidate_kind = None
+        _force_asset_disclosure = False
+
+        if matched_prefix == 'Assets' and dim_count > 0:
+            _asset_candidate_kind = _gb_segment_asset_concept_kind(concept, dur)
+            if _asset_candidate_kind == 'capital_additions':
+                matched_prefix = 'Capital Expenditures'
+                _force_asset_disclosure = True
+            elif _asset_candidate_kind == 'property_plant_equipment':
+                matched_prefix = 'Property, Plant & Equipment'
+                _force_asset_disclosure = True
+            elif _asset_candidate_kind != 'balance':
+                # Preserve uncertain asset-related facts as disclosures, but do
+                # not publish them as ending segment assets.
+                _force_asset_disclosure = True
 
         if matched_prefix and dim_count > 0:
             if active_dim_cols is None:
@@ -9132,11 +11257,30 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             if _is_segment_noise_value(concept, val):
                 continue
 
-            is_business = any(_dim_col_roles[c]['business'] for c in active_dim_cols)
-            is_geographic = any(_dim_col_roles[c]['geographic'] for c in active_dim_cols)
+            _business_axis_cols = [
+                c for c in active_dim_cols if _dim_col_roles[c]['business']]
+            _active_business_axis_semantics = {
+                c: _concept_business_axis_semantic(concept, c)
+                for c in _business_axis_cols
+            }
+            _semantic_geo_business_axes = [
+                c for c in _business_axis_cols
+                if _active_business_axis_semantics.get(c) == 'geographic']
+            _semantic_business_axes = [
+                c for c in _business_axis_cols
+                if _active_business_axis_semantics.get(c) != 'geographic']
+            is_business = bool(_semantic_business_axes)
+            is_geographic = (
+                any(_dim_col_roles[c]['geographic'] for c in active_dim_cols)
+                or bool(_semantic_geo_business_axes))
             is_reconciliation = any(_dim_col_roles[c]['reconciliation'] for c in active_dim_cols)
             is_product = any(_dim_col_roles[c]['product'] for c in active_dim_cols)
             is_equity_component = any(_dim_col_roles[c]['equity_component'] for c in active_dim_cols)
+            is_supplemental = any(
+                _dim_col_roles[c]['supplemental_axis'] for c in active_dim_cols)
+            is_incompatible_segment_axis = any(
+                _dim_col_roles[c].get('incompatible_segment_axis', False)
+                for c in active_dim_cols)
 
             label_mems = []
             seen_mems = set()
@@ -9157,12 +11301,13 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 #   is a known geographic axis (is_geographic=True).  Without that
                 #   confirmation an ISO code is almost certainly an internal abbreviation
                 #   (e.g. NVDA labels their Networking sub-segment as TW internally).
-                if _REGION_KEYWORDS_RE.search(ml) or ml in GEOGRAPHIC_COUNTRIES:
-                    is_definitely_geo = True
-                elif ml in GEOGRAPHIC_CODES and is_geographic:
-                    is_definitely_geo = True
+                if is_geographic:
+                    if _REGION_KEYWORDS_RE.search(ml) or ml in GEOGRAPHIC_COUNTRIES:
+                        is_definitely_geo = True
+                    elif ml in GEOGRAPHIC_CODES:
+                        is_definitely_geo = True
 
-                if is_geographic or is_definitely_geo:
+                if is_geographic:
                     if ml in GEOGRAPHIC_COUNTRIES:
                         is_country = True
                     elif ml in GEOGRAPHIC_CODES and is_geographic:
@@ -9178,6 +11323,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 seen_mems.add(ml)
 
             if not label_mems: continue
+
+            invalid_segment_member = any(
+                _GB_CONTEXT_ROLE_BLOCKER_RE.search(member)
+                or _GB_NON_MEMBER_ACCOUNTING_ROW_RE.fullmatch(
+                    str(member).casefold().rstrip(':').strip())
+                or (matched_prefix == 'Revenue'
+                    and _GB_NON_REVENUE_MEMBER_RE.fullmatch(str(member).strip()))
+                for member in label_mems)
 
             # SPECIFICITY FILTER: If multiple members exist, keep only the most specific.
             if len(label_mems) > 1:
@@ -9202,7 +11355,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     filtered = [m for m in mems if m not in to_drop]
                     label_mems = filtered if filtered else label_mems
 
-            if is_equity_component and not is_business and not is_geographic and not is_product:
+            if (_force_asset_disclosure or is_reconciliation or is_supplemental
+                    or is_incompatible_segment_axis or invalid_segment_member):
+                # Reconciliation, pro-forma, fair-value, securities, tax,
+                # derivative, lease, acquisition, cash-flow and other accounting
+                # overlays may coexist with a real business axis.  They are not
+                # ordinary segment rows and fail closed to disclosures.
+                seg_category = '6_Disclosures'
+            elif is_equity_component and not is_business and not is_geographic and not is_product:
                 seg_category = '6_Disclosures'
             elif matched_prefix in ('Customer Concentration %', 'Customer Revenue'): 
                 seg_category = '7_Concentration_Risk'
@@ -9216,13 +11376,23 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     # A dynamically intelligent check that accurately separates 
                     # purely geographic segment groupings ("International Revenues")
                     # from localized business segments ("International Transaction Revenues")
-                    is_geo_mem = _is_pure_geographic_label(m, is_geographic)
+                    is_geo_mem = (
+                        is_geographic
+                        and _is_pure_geographic_label(m, True)
+                    )
                     
                     if is_geo_mem:
                         final_geo_count += 1
                     else:
                         final_biz_count += 1
                 
+                # A complete axis-level classification outranks an isolated
+                # member name.  Mixed Amazon-style axes remain business even
+                # when two members are geographic words; all-geographic
+                # Apple-style axes are treated as geography.
+                if is_business and not is_geographic:
+                    final_biz_count += final_geo_count
+                    final_geo_count = 0
                 is_cross_tabulated = (is_business and is_geographic) or (final_geo_count > 0 and final_biz_count > 0)
                 is_pure_geo = (is_geographic or final_geo_count > 0) and not is_cross_tabulated
                 
@@ -9237,15 +11407,68 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 elif is_pure_product and matched_prefix in _FACE_DISAGG_PREFIXES:
                     # Nature-of-revenue disaggregation presented on the income
                     # statement face -- keep it there so the granular cost /
-                    # revenue lines (IBM: Services/Sales/Financing; MSFT/AAPL:
-                    # Product/Service) continue into modern filings instead of
-                    # being buried as pseudo-segments in the 4a block.
+                    # revenue lines continue into modern filings.
                     seg_category = '1_Income_Statement'
-                else:
+                elif (is_pure_product and matched_prefix in {
+                        'Gross Profit', 'Operating Income', 'Operating Expenses',
+                        'Contribution', 'Segment Profit'}):
+                    # Product/service profitability is valid segment detail
+                    # (Apple reports product/service gross profit).  Preserve it
+                    # instead of demoting it to disclosures merely because the
+                    # axis is ProductOrServiceAxis rather than a business axis.
                     seg_category = '4a_Segments_Business'
+                elif is_business:
+                    seg_category = '4a_Segments_Business'
+                else:
+                    # Preserve the fact, but unknown disclosure axes are not
+                    # evidence of a reportable business segment.
+                    seg_category = '6_Disclosures'
+
+            # On a mixed reportable axis, a revenue-only participant whose
+            # caption is a pure geography belongs in the geographic revenue
+            # section, while non-geographic peers remain business segments.
+            # Other metrics stay with the business-segment P&L.  This is based
+            # on the complete axis member set, never on a ticker or company.
+            if (matched_prefix == 'Revenue'
+                    and seg_category == '4a_Segments_Business'
+                    and len(label_mems) == 1
+                    and any(_business_axis_mixed_geography.get(c, False)
+                            for c in _business_axis_cols)):
+                _mixed_geo_kind = _classify_geographic_member(
+                    label_mems[0], False)
+                if _mixed_geo_kind is not None:
+                    _mixed_geo_member = _canonical_geographic_member_label(
+                        label_mems[0], False)
+                    label_mems = [_mixed_geo_member]
+                    seg_category = (
+                        '4c_Segments_Geographic_Countries'
+                        if _mixed_geo_kind == 'country'
+                        else '4b_Segments_Geographic_Regions')
 
             joined_mems = " - ".join(sorted(label_mems))
             label = f"{matched_prefix} - {joined_mems}"
+            _axis_signature = ' | '.join(sorted(str(c) for c in active_dim_cols))
+            _member_signature = ' | '.join(sorted(str(m) for m in label_mems))
+            if seg_category == '4a_Segments_Business':
+                _analytical_basis = 'business_segment'
+                _admission_rule = 'recognized_business_axis' if is_business else 'dimension_member_evidence'
+                _classification_confidence = 0.995 if is_business else 0.90
+            elif seg_category in {'4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries'}:
+                _analytical_basis = 'geographic'
+                _admission_rule = 'recognized_geographic_axis' if is_geographic else 'geographic_member_evidence'
+                _classification_confidence = 0.995 if is_geographic else 0.92
+            elif seg_category == '4d_Segments_Cross_Tabulated':
+                _analytical_basis = 'cross_tabulated_segment_geography'
+                _admission_rule = 'cross_tabulated_dimensions'
+                _classification_confidence = 0.99
+            elif seg_category == '1_Income_Statement':
+                _analytical_basis = 'product_service_disaggregation'
+                _admission_rule = 'product_service_axis_face_disaggregation'
+                _classification_confidence = 0.99
+            else:
+                _analytical_basis = 'dimensioned_disclosure'
+                _admission_rule = 'dimensioned_disclosure'
+                _classification_confidence = 0.95
             
             rank = 999
             core_label = _CONCEPT_TAG_TO_LABEL.get(concept)
@@ -9262,6 +11485,46 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                 'Filed': _filing_date_raw, 'TagRank': rank,
                 'DimCount': dim_count, 'IsCalculated': is_calculated, 'Concept': concept,
+                'SourceKind': 'xbrl',
+                'SourceAdmissionRule': _admission_rule,
+                'SourceSemanticType': matched_prefix,
+                'SourceAnalyticalBasis': _analytical_basis,
+                'SourceDirectness': ('calculation_linkbase' if is_calculated else 'reported'),
+                'SourceClassificationConfidence': _classification_confidence,
+                'SourceTableRole': 'xbrl_dimensional_fact',
+                'SourceDimensionAxes': _axis_signature,
+                'SourceDimensionMembers': _member_signature,
+                'SourceAxisSignature': _axis_signature,
+                'SourceMemberSignature': _member_signature,
+                'SourceAxisSemantic': ' | '.join(sorted({
+                    _active_business_axis_semantics.get(c, '')
+                    for c in active_dim_cols
+                    if _dim_col_roles[c]['business']
+                    and _active_business_axis_semantics.get(c)
+                })) or None,
+                'SourcePeriodBasis': (
+                    _GB_BASIS_INSTANT_END
+                    if _asset_candidate_kind == 'balance'
+                    else (_GB_BASIS_DURATION_FLOW
+                          if _asset_candidate_kind else None)
+                ),
+                'SourceBasisConfidence': (
+                    0.995 if _asset_candidate_kind == 'balance'
+                    else (0.98 if _asset_candidate_kind else None)
+                ),
+                'SourceAssetMetricKind': _asset_candidate_kind,
+                'SourceMetricIdentity': (
+                    'ending_segment_assets'
+                    if (_asset_candidate_kind == 'balance'
+                        and seg_category == '4a_Segments_Business')
+                    else ('geographic_asset_balance'
+                          if (_asset_candidate_kind == 'balance'
+                              and seg_category in {
+                                  '4b_Segments_Geographic_Regions',
+                                  '4c_Segments_Geographic_Countries',
+                                  '6_Disclosures'})
+                          else (_asset_candidate_kind or matched_prefix))
+                ),
                 'SourceGeographicBasis': (
                     _gb_geographic_basis_from_context(
                         ' '.join(str(c) for c in active_dim_cols) + ' ' + concept)
@@ -9273,19 +11536,49 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             })
         
         elif matched_prefix and not captured_by_concept_map and dim_count == 0:
+            # An undimensioned concept-name match is not segment evidence.  The
+            # old fallback promoted any concept containing broad words such as
+            # revenue/income/assets/amortization into 4a, which is how debt,
+            # fair-value, lease, tax, and consolidated statement facts became
+            # pseudo-segments.  Preserve only narrowly typed non-segment uses.
             already_in_concept_map = concept in _tag_to_labels
-            if already_in_concept_map and concept not in REVENUE_SUBTYPE_CONCEPTS: continue
-            
-            custom_name = clean_name(concept)
-            if len(custom_name) < 3 or custom_name.lower() in [matched_prefix.lower(), 'total', 'consolidated']:
+            if already_in_concept_map and concept not in REVENUE_SUBTYPE_CONCEPTS:
                 continue
 
-            if matched_prefix in ('Customer Concentration %', 'Customer Revenue'): seg_category = '7_Concentration_Risk'
-            elif 'Useful Life' in matched_prefix or 'RPO' in matched_prefix: seg_category = '6_Disclosures'
-            else: seg_category = '4a_Segments_Business'
+            custom_name = clean_name(concept)
+            if len(custom_name) < 3 or custom_name.lower() in {
+                    matched_prefix.lower(), 'total', 'consolidated'}:
+                continue
+
+            if matched_prefix in ('Customer Concentration %', 'Customer Revenue'):
+                seg_category = '7_Concentration_Risk'
+                admission_rule = 'undimensioned_typed_concentration_disclosure'
+                analytical_basis = 'concentration_disclosure'
+            elif 'Useful Life' in matched_prefix or 'RPO' in matched_prefix:
+                seg_category = '6_Disclosures'
+                admission_rule = 'undimensioned_typed_disclosure'
+                analytical_basis = 'typed_disclosure'
+            elif concept in REVENUE_SUBTYPE_CONCEPTS:
+                # Retain the useful number, but do not misrepresent it as a
+                # reportable segment.  It is consolidated revenue detail.
+                seg_category = '1_Income_Statement'
+                admission_rule = 'explicit_revenue_subtype_allowlist'
+                analytical_basis = 'revenue_disaggregation'
+            elif (matched_prefix == 'Revenue'
+                    and re.search(r'Revenues?$', str(concept), re.I)
+                    and not any(token in c_lower for token in (
+                        'deferred', 'contractliability', 'performanceobligation',
+                        'concentration', 'geographic', 'tax', 'recognized'))):
+                # Recover clearly named consolidated revenue components such as
+                # PrincipalTransactionsRevenue without restoring the old broad
+                # keyword-to-segment fallback.
+                seg_category = '1_Income_Statement'
+                admission_rule = 'typed_revenue_component_suffix'
+                analytical_basis = 'revenue_disaggregation'
+            else:
+                continue
 
             label = f"{matched_prefix} - {custom_name}"
-            
             rank = 999
             core_label = _CONCEPT_TAG_TO_LABEL.get(concept)
             if core_label and core_label in CONCEPT_MAP:
@@ -9301,8 +11594,31 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                 'Filed': _filing_date_raw, 'TagRank': rank,
                 'DimCount': 0, 'IsCalculated': is_calculated, 'Concept': concept,
+                'SourceKind': 'xbrl',
+                'SourceAdmissionRule': admission_rule,
+                'SourceSemanticType': matched_prefix,
+                'SourceAnalyticalBasis': analytical_basis,
+                'SourceDirectness': ('calculation_linkbase' if is_calculated else 'reported'),
+                'SourceClassificationConfidence': 0.99,
+                'SourceTableRole': 'xbrl_undimensioned_typed_fact',
                 'SourceGeographicBasis': _gb_geographic_basis_from_context(concept),
             })
+
+
+    # Recover complete instant segment-asset groups directly from the filing's
+    # dimensional XBRL before HTML rescue can introduce isolated or ambiguous
+    # candidates.  The reconciliation identity and repeated-date requirement
+    # make this fail closed for incomplete/non-segment asset disclosures.
+    try:
+        extracted, _atomic_asset_facts = (
+            _gb_recover_atomic_dimensional_segment_asset_groups(
+                facts_df, extracted, ye_month, _filing_date_raw,
+                member_labeler=_clean_member_tag,
+                filing_url=_get_filing_url_once()))
+    except Exception as _atomic_asset_error:
+        _debug_print(
+            f"  [Asset Group] Dimensional recovery skipped "
+            f"({type(_atomic_asset_error).__name__}: {_atomic_asset_error})")
 
     has_interest = any(x['Label'] == 'Interest Expense' for x in extracted)
     if not has_interest:
@@ -9404,6 +11720,25 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         _fact.setdefault('Accession', _accession_no)
         _fact.setdefault('FilingUrl', _filing_url_for_meta)
         _fact.setdefault('Filed', _filing_date_raw)
+        _concept_text = str(_fact.get('Concept') or '')
+        _fact.setdefault(
+            'SourceKind',
+            'html_table' if _concept_text.startswith('HTML') else
+            ('derived' if bool(_fact.get('IsCalculated', False)) else 'xbrl'))
+        _fact.setdefault(
+            'SourceDirectness',
+            'calculation_linkbase' if bool(_fact.get('IsCalculated', False)) else 'reported')
+        _fact.setdefault('SourceAdmissionRule', 'legacy_typed_path')
+        _fact.setdefault('SourceSemanticType', _split_segment_display_label(
+            str(_fact.get('Label') or ''))[0])
+        _fact.setdefault('SourceAnalyticalBasis', 'unspecified')
+        _fact.setdefault('SourceClassificationConfidence', 0.80)
+        _fact.setdefault('SourceTableRole', 'unspecified')
+        _fact.setdefault('SourceDimensionAxes', None)
+        _fact.setdefault('SourceDimensionMembers', None)
+        _fact.setdefault('SourceAxisSignature', None)
+        _fact.setdefault('SourceMemberSignature', None)
+        _fact.setdefault('SourceAxisSemantic', None)
         if 'Start' not in _fact:
             _start_str = None
             try:
@@ -10602,7 +12937,41 @@ def _merge_concurrent_member_variants(df: pd.DataFrame) -> pd.DataFrame:
         return False
 
     rename_map = {}
+
+    # Exact acronym aliases (AWS / Amazon Web Services) are not token subsets,
+    # but repeated identical periods prove they are one member.  Merge only when
+    # the acronym exactly matches the other label's initials, at least two
+    # overlapping periods agree within 0.1%, and no period conflicts.
+    def _member_text(lbl):
+        return lbl.split(' - ', 1)[1] if ' - ' in lbl else lbl
+    def _initials(text):
+        words = re.findall(r'[A-Za-z0-9]+', text)
+        return ''.join(word[0] for word in words if word).upper()
+    for i, a in enumerate(labels):
+        ma = _member_text(a).strip()
+        for b in labels[i + 1:]:
+            mb = _member_text(b).strip()
+            a_is_acronym = bool(re.fullmatch(r'[A-Z0-9]{2,6}', ma))
+            b_is_acronym = bool(re.fullmatch(r'[A-Z0-9]{2,6}', mb))
+            if a_is_acronym == b_is_acronym:
+                continue
+            acronym, expanded = (ma, mb) if a_is_acronym else (mb, ma)
+            if _initials(expanded) != acronym.upper():
+                continue
+            overlap = set(pv[a]).intersection(pv[b])
+            if len(overlap) < 2:
+                continue
+            if any(abs(float(pv[a][period]) - float(pv[b][period]))
+                   > max(abs(float(pv[a][period])), abs(float(pv[b][period])), 1.0) * 0.001 + 1.0
+                   for period in overlap):
+                continue
+            canonical = a if a_is_acronym else b
+            donor = b if a_is_acronym else a
+            rename_map[donor] = canonical
+
     for a in labels:
+        if a in rename_map:
+            continue
         ta = tok[a]
         if not ta or not (ta - dynamic_generic - vague_tokens):
             continue   # need a real distinctive token
@@ -11035,6 +13404,1723 @@ def _derive_crosstabulated_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def _gb_semantic_duplicate_priority(metric: str) -> int:
+    """Semantic authority used only after values prove a duplicate series."""
+    key = _normalize_label_key(metric)
+    return {
+        'revenue': 120,
+        'expense attributable to segment': 118,
+        'contribution': 116,
+        'segment profit': 116,
+        'operating income': 115,
+        'gross profit': 114,
+        'cost of revenue': 112,
+        'assets': 112,
+        'operating expenses': 108,
+        'depreciation and amortization': 105,
+        'other segment item': 74,
+        # A filed-specific cost subtotal is more authoritative than a generic
+        # 'Operating Expenses' alias when the two prove to be the same series.
+        # Revenue still outranks it, so a revenue row accidentally re-parsed as
+        # other costs is quarantined rather than replacing the real revenue.
+        'other cost and expense': 111,
+        'significant segment expense': 66,
+        'segment expense': 62,
+    }.get(key, 90)
+
+
+def _gb_duplicate_member_tokens(label: str) -> set[str]:
+    _metric, member = _split_segment_display_label(label)
+    text = _normalize_label_key(_gb_clean_member_footnote(member))
+    generic = {
+        'operating', 'segment', 'reportable', 'business', 'service', 'services',
+        'post', 'change', 'pre', 'the', 'and', 'of', 'all',
+    }
+    return {token for token in text.split() if token and token not in generic}
+
+
+def _gb_duplicate_members_related(left_label: str, right_label: str) -> bool:
+    left = _gb_duplicate_member_tokens(left_label)
+    right = _gb_duplicate_member_tokens(right_label)
+    if not left or not right:
+        return False
+    if left == right or left < right or right < left:
+        return True
+    # Acronym aliases (AWS / Amazon Web Services).
+    def _initials(tokens):
+        return ''.join(token[0] for token in sorted(tokens)).upper()
+    left_member = _split_segment_display_label(left_label)[1].strip()
+    right_member = _split_segment_display_label(right_label)[1].strip()
+    if re.fullmatch(r'[A-Z0-9]{2,6}', left_member):
+        words = re.findall(r'[A-Za-z0-9]+', right_member)
+        if ''.join(word[0] for word in words).upper() == left_member.upper():
+            return True
+    if re.fullmatch(r'[A-Z0-9]{2,6}', right_member):
+        words = re.findall(r'[A-Za-z0-9]+', left_member)
+        if ''.join(word[0] for word in words).upper() == right_member.upper():
+            return True
+    return False
+
+
+def _gb_quarantine_conflicting_semantic_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    """Quarantine source-proven and statistically proven semantic duplicates.
+
+    v60 handled only a *strict partial* copy and ran before final label
+    reconciliation.  Complete duplicates therefore survived (Google revenue
+    re-published as expenses, Palantir attributable expenses re-published as
+    other segment items), and late-created partial duplicates survived too.
+
+    This gate remains conservative:
+      * different semantic types are compared only when one is a known
+        low-specificity segment label;
+      * at least three overlapping periods must agree with zero conflicts;
+      * unrelated member names require six overlaps and four distinct values;
+      * same-semantic aliases are relabelled, never value-filled or derived;
+      * source-cell identity, when available, is the strongest proof.
+    """
+    required = {'Category', 'Label', 'Value', 'FY', 'Q'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    work = df.copy()
+    segment = work[work['Category'].eq('4a_Segments_Business')].copy()
+    if segment.empty:
+        return work
+
+    labels = sorted(segment['Label'].dropna().astype(str).unique())
+    rows_by_label = {label: segment[segment['Label'].eq(label)].copy()
+                     for label in labels}
+
+    def _period_map(rows):
+        result = {}
+        for (fy, q), group in rows.groupby(['FY', 'Q'], dropna=False, sort=False):
+            values = pd.to_numeric(group['Value'], errors='coerce').dropna()
+            if values.empty:
+                continue
+            result[(fy, str(q))] = float(values.median())
+        return result
+
+    maps = {label: _period_map(rows) for label, rows in rows_by_label.items()}
+
+    def _row_score(rows, label, semantic_first=True):
+        metric = _split_segment_display_label(label)[0]
+        coverage = len(maps.get(label, {}))
+        direct = int((rows.get(
+            'SourceDirectness', pd.Series('', index=rows.index)
+        ).fillna('').astype(str).str.casefold() == 'reported').any())
+        kind = int((rows.get(
+            'SourceKind', pd.Series('', index=rows.index)
+        ).fillna('').astype(str).str.casefold() == 'xbrl').any())
+        trust = float(pd.to_numeric(rows.get(
+            'SourceClassificationConfidence', pd.Series(0.0, index=rows.index)
+        ), errors='coerce').fillna(0.0).max())
+        priority = _gb_semantic_duplicate_priority(metric)
+        # Acronyms are stable, concise canonical names when identity is proven.
+        member = _split_segment_display_label(label)[1].strip()
+        acronym = int(bool(re.fullmatch(r'[A-Z0-9]{2,6}', member)))
+        concise = -len(label)
+        if semantic_first:
+            return priority, direct, kind, trust, coverage, acronym, concise
+        return acronym, coverage, direct, kind, trust, concise
+
+    low_specificity = {
+        'other segment item', 'other cost and expense',
+        'significant segment expense', 'segment expense',
+    }
+    rename_map = {}
+    drop_labels = set()
+    decisions = []
+
+    for i, left_label in enumerate(labels):
+        left_metric = _normalize_label_key(
+            _split_segment_display_label(left_label)[0])
+        left_map = maps[left_label]
+        if not left_map:
+            continue
+        for right_label in labels[i + 1:]:
+            right_metric = _normalize_label_key(
+                _split_segment_display_label(right_label)[0])
+            right_map = maps[right_label]
+            if not right_map:
+                continue
+            same_metric = left_metric == right_metric
+            if (not same_metric
+                    and left_metric not in low_specificity
+                    and right_metric not in low_specificity):
+                continue
+
+            overlap = set(left_map).intersection(right_map)
+            strict_partial = (set(left_map) < set(right_map)
+                              or set(right_map) < set(left_map))
+            if len(overlap) < 2:
+                continue
+            if len(overlap) < 3 and not strict_partial:
+                continue
+            exact_matches = [
+                period for period in overlap
+                if _gb_close_values(left_map[period], right_map[period])]
+            # Same-semantic aliases may differ by one displayed-million rounding
+            # cell; semantic conflicts must remain exact.
+            near_matches = [
+                period for period in overlap
+                if abs(left_map[period] - right_map[period])
+                   <= max(abs(left_map[period]), abs(right_map[period]), 1.0) * 0.0015 + 1.0]
+            if same_metric:
+                if len(near_matches) < max(3, int(len(overlap) * 0.90)):
+                    continue
+                if len(overlap) - len(near_matches) > 1:
+                    continue
+            elif len(exact_matches) != len(overlap):
+                continue
+
+            cells_left = set(rows_by_label[left_label].get(
+                'SourceCellIdentity', pd.Series(dtype=object)).dropna().astype(str))
+            cells_right = set(rows_by_label[right_label].get(
+                'SourceCellIdentity', pd.Series(dtype=object)).dropna().astype(str))
+            same_source_cells = bool(cells_left.intersection(cells_right))
+            member_related = _gb_duplicate_members_related(left_label, right_label)
+            distinct_values = len({round(left_map[p], 6) for p in exact_matches})
+            statistical_proof = len(overlap) >= 6 and distinct_values >= 4
+            if not (same_source_cells or member_related or statistical_proof):
+                continue
+
+            if same_metric:
+                left_score = _row_score(rows_by_label[left_label], left_label, False)
+                right_score = _row_score(rows_by_label[right_label], right_label, False)
+                winner, loser = ((left_label, right_label)
+                                 if left_score >= right_score
+                                 else (right_label, left_label))
+                rename_map[loser] = winner
+                decisions.append(('alias', loser, winner, len(overlap)))
+            else:
+                left_score = _row_score(rows_by_label[left_label], left_label, True)
+                right_score = _row_score(rows_by_label[right_label], right_label, True)
+                winner, loser = ((left_label, right_label)
+                                 if left_score >= right_score
+                                 else (right_label, left_label))
+                drop_labels.add(loser)
+                decisions.append(('semantic', loser, winner, len(overlap)))
+
+    # Resolve chained aliases before applying them.
+    def _resolve(label):
+        seen = set()
+        while label in rename_map and label not in seen:
+            seen.add(label)
+            label = rename_map[label]
+        return label
+    rename_map = {label: _resolve(target) for label, target in rename_map.items()
+                  if _resolve(target) != label}
+    if rename_map:
+        work['Label'] = work['Label'].map(lambda label: rename_map.get(label, label))
+    if drop_labels:
+        work = work[~work['Label'].isin(drop_labels)].copy()
+
+    if decisions:
+        messages = [f"{loser} -> {winner} ({overlap} periods)"
+                    for _kind, loser, winner, overlap in decisions]
+        print('  [Semantic Gate] Consolidated/quarantined duplicate row(s): '
+              + '; '.join(sorted(set(messages))))
+    return work
+
+def _gb_consolidate_pivot_segment_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    """Final publication gate for duplicate 4a series.
+
+    This runs after accounting/repair passes because those passes can create or
+    rename rows after long-form duplicate reconciliation.  It only consolidates
+    value-proven copies; no new number is calculated.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    indices = [idx for idx in out.index
+               if idx[0] == '4a_Segments_Business']
+    if len(indices) < 2:
+        return out
+    low_specificity = {
+        'other segment item', 'other cost and expense',
+        'significant segment expense', 'segment expense',
+    }
+    dropped = set()
+    renamed = []
+
+    def _series(idx):
+        return pd.to_numeric(out.loc[idx], errors='coerce')
+
+    def _coverage(idx):
+        return int(_series(idx).notna().sum())
+
+    def _canonical_same_metric(left, right):
+        left_member = _split_segment_display_label(left[1])[1].strip()
+        right_member = _split_segment_display_label(right[1])[1].strip()
+        left_acronym = bool(re.fullmatch(r'[A-Z0-9]{2,6}', left_member))
+        right_acronym = bool(re.fullmatch(r'[A-Z0-9]{2,6}', right_member))
+        if left_acronym != right_acronym:
+            return left if left_acronym else right
+        if _coverage(left) != _coverage(right):
+            return left if _coverage(left) > _coverage(right) else right
+        return left if len(left[1]) <= len(right[1]) else right
+
+    for i, left in enumerate(indices):
+        if left in dropped or left not in out.index:
+            continue
+        left_metric = _normalize_label_key(
+            _split_segment_display_label(left[1])[0])
+        left_series = _series(left)
+        for right in indices[i + 1:]:
+            if right in dropped or right not in out.index:
+                continue
+            right_metric = _normalize_label_key(
+                _split_segment_display_label(right[1])[0])
+            same_metric = left_metric == right_metric
+            if (not same_metric
+                    and left_metric not in low_specificity
+                    and right_metric not in low_specificity):
+                continue
+            right_series = _series(right)
+            overlap = left_series.notna() & right_series.notna()
+            count = int(overlap.sum())
+            if count < 3:
+                continue
+            left_values = left_series[overlap]
+            right_values = right_series[overlap]
+            exact = np.isclose(left_values, right_values, rtol=1e-9, atol=1.0)
+            near = np.isclose(left_values, right_values, rtol=0.0015, atol=1.0)
+            if same_metric:
+                if int(near.sum()) < max(3, int(count * 0.90)):
+                    continue
+                if count - int(near.sum()) > 1:
+                    continue
+            elif not bool(exact.all()):
+                continue
+            related = _gb_duplicate_members_related(left[1], right[1])
+            distinct = len({round(float(value), 6) for value in left_values[exact]})
+            statistical = count >= 6 and distinct >= 4
+            if not (related or statistical):
+                continue
+
+            if same_metric:
+                winner = _canonical_same_metric(left, right)
+                loser = right if winner == left else left
+                winner_values = _series(winner)
+                loser_values = _series(loser)
+                # Relabel/fill only periods absent from the canonical row.  Any
+                # overlapping conflict remains with the chosen canonical source.
+                out.loc[winner] = winner_values.combine_first(loser_values)
+                out = out.drop(index=loser)
+                dropped.add(loser)
+                renamed.append(f'{loser[1]} -> {winner[1]}')
+                if loser == left:
+                    left = winner
+                    left_series = _series(winner)
+                    left_metric = right_metric
+            else:
+                left_priority = _gb_semantic_duplicate_priority(left_metric)
+                right_priority = _gb_semantic_duplicate_priority(right_metric)
+                if left_priority == right_priority:
+                    # Equal-authority accounting meanings are not safe to
+                    # choose between merely because their values happen to tie.
+                    continue
+                winner, loser = ((left, right) if left_priority > right_priority
+                                 else (right, left))
+                out = out.drop(index=loser)
+                dropped.add(loser)
+                renamed.append(f'{loser[1]} -> {winner[1]}')
+                if loser == left:
+                    break
+    if renamed:
+        print('  [Semantic Gate] Final pivot duplicate cleanup: '
+              + '; '.join(sorted(set(renamed))))
+    return out
+
+
+def _gb_pivot_series_close(left, right, *, min_periods=3,
+                           rtol=0.0015, atol=2_000_000.0) -> bool:
+    left_n = pd.to_numeric(left, errors='coerce')
+    right_n = pd.to_numeric(right, errors='coerce')
+    overlap = left_n.notna() & right_n.notna()
+    count = int(overlap.sum())
+    if count < int(min_periods):
+        return False
+    return bool(np.isclose(
+        left_n[overlap], right_n[overlap], rtol=rtol, atol=atol).all())
+
+
+def _gb_rename_or_merge_pivot_row(df: pd.DataFrame, old_idx, new_idx,
+                                  *, prefer_new=True) -> pd.DataFrame:
+    """Rename one pivot row without losing periods or dataframe attrs."""
+    if old_idx not in df.index or old_idx == new_idx:
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    old_values = pd.to_numeric(out.loc[old_idx], errors='coerce')
+    if new_idx in out.index:
+        new_values = pd.to_numeric(out.loc[new_idx], errors='coerce')
+        merged = (new_values.combine_first(old_values) if prefer_new
+                  else old_values.combine_first(new_values))
+        out.loc[new_idx, :] = merged.values
+        out = out.drop(index=old_idx)
+    else:
+        tuples = [new_idx if idx == old_idx else idx for idx in out.index]
+        out.index = pd.MultiIndex.from_tuples(
+            tuples, names=df.index.names)
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_repair_discrete_q4_operating_openings(df: pd.DataFrame) -> pd.DataFrame:
+    """Use prior-Q3 ending balances as discrete-Q4 opening balances.
+
+    Annual rollforwards report the beginning of the fiscal year.  A quarterly
+    output requires the beginning of Q4, which is the immediately preceding Q3
+    ending balance.  This is an identity correction, not an estimate.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    starts = []
+    endings = []
+    for idx in out.index:
+        if idx[0] != OPERATING_METRICS_CATEGORY:
+            continue
+        label = str(idx[1])
+        family = _gb_operating_metric_family(label)
+        if not family:
+            continue
+        if _GB_BEGINNING_RE.search(label):
+            starts.append((idx, family))
+        if _GB_ENDING_RE.search(label):
+            endings.append((idx, family))
+    end_by_family = {family: idx for idx, family in endings}
+    changed = []
+    for start_idx, family in starts:
+        end_idx = end_by_family.get(family)
+        if end_idx is None:
+            continue
+        for column in out.columns:
+            match = re.fullmatch(r'(\d{4})-Q4', str(column))
+            if not match:
+                continue
+            q3 = f"{match.group(1)}-Q3"
+            if q3 not in out.columns:
+                continue
+            prior_end = pd.to_numeric(pd.Series([out.at[end_idx, q3]]), errors='coerce').iloc[0]
+            if pd.isna(prior_end):
+                continue
+            current = pd.to_numeric(pd.Series([out.at[start_idx, column]]), errors='coerce').iloc[0]
+            if pd.isna(current) or not np.isclose(current, prior_end, rtol=1e-9, atol=1.0):
+                out.at[start_idx, column] = float(prior_end)
+                changed.append(f'{start_idx[1]} {column}')
+    if changed:
+        print('  [Operating Continuity] Corrected discrete-Q4 opening balance(s): '
+              + ', '.join(changed))
+    return out
+
+
+def _gb_consolidate_pivot_operating_gain_loss_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Publish one signed series for alternating gain/loss captions."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    groups = defaultdict(list)
+    for idx in out.index:
+        if idx[0] != OPERATING_METRICS_CATEGORY:
+            continue
+        label = str(idx[1])
+        if not re.search(r'\b(?:gains?|losses?)\b', label, re.I):
+            continue
+        groups[_gb_neutral_gain_loss_label(label)].append(idx)
+    changed = []
+    for canonical, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        numeric = {idx: pd.to_numeric(out.loc[idx], errors='coerce') for idx in indices}
+        overlap_periods = 0; matching_overlap = 0
+        for col in out.columns:
+            vals = [float(series[col]) for series in numeric.values() if pd.notna(series[col])]
+            if len(vals) < 2:
+                continue
+            overlap_periods += 1
+            if all(np.isclose(vals[0], value, rtol=1e-6, atol=1.0) for value in vals[1:]):
+                matching_overlap += 1
+        if overlap_periods and matching_overlap < max(1, overlap_periods - 1):
+            continue
+        coverage = {idx: int(series.notna().sum()) for idx, series in numeric.items()}
+        preferred = max(indices, key=lambda idx: (coverage[idx], -len(str(idx[1]))))
+        merged = numeric[preferred].copy()
+        for col in out.columns:
+            candidates = [(idx, series[col]) for idx, series in numeric.items()
+                          if pd.notna(series[col])]
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                merged[col] = candidates[0][1]
+                continue
+            values = [float(value) for _, value in candidates]
+            if all(np.isclose(values[0], value, rtol=1e-6, atol=1.0)
+                   for value in values[1:]):
+                merged[col] = candidates[0][1]
+                continue
+            sign_consistent = [
+                (idx, value) for idx, value in candidates
+                if ((float(value) < 0 and 'loss' in str(idx[1]).casefold())
+                    or (float(value) >= 0 and 'gain' in str(idx[1]).casefold()))
+            ]
+            if len(sign_consistent) == 1:
+                merged[col] = sign_consistent[0][1]
+        for idx in indices:
+            out = out.drop(index=idx)
+        out.loc[(OPERATING_METRICS_CATEGORY, canonical), :] = merged.values
+        changed.append(canonical)
+    if changed:
+        print('  [Operating Alias] Consolidated signed gain/loss row(s): '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+def _gb_promote_proven_segment_operating_expenses(df: pd.DataFrame) -> pd.DataFrame:
+    """Promote costs rows only inside an already-proven segment P&L basis.
+
+    At least two members must already carry direct ``Operating Expenses`` rows.
+    A disclosure row may then either extend a related member across an older era
+    or be proven by Revenue minus Operating Income.  This prevents a consolidated
+    total-cost row (for example a subtotal containing employee compensation)
+    from being relabelled merely because the arithmetic happens to balance.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    established = []
+    for idx in out.index:
+        if idx[0] != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) == 'operating expense' and member:
+            established.append(idx)
+    if len({_normalize_label_key(_split_segment_display_label(idx[1])[1])
+            for idx in established}) < 2:
+        return out
+
+    candidates = []
+    for idx in list(out.index):
+        if idx[0] != '6_Disclosures':
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) not in {'cost and expense', 'operating expense'}:
+            continue
+        if member:
+            candidates.append((idx, member))
+    changed = []
+    for old_idx, member in candidates:
+        if old_idx not in out.index:
+            continue
+        costs = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        related_existing = [idx for idx in established
+                            if idx in out.index and _gb_duplicate_members_related(
+                                f'Operating Expenses - {member}', idx[1])]
+        # First, merge a same-measure alias/era continuation into the established
+        # canonical row.  Overlapping values must agree; disjoint historical
+        # coverage is allowed because the basis is already proven by siblings.
+        merged_existing = False
+        for target in related_existing:
+            target_values = pd.to_numeric(out.loc[target], errors='coerce')
+            overlap = costs.notna() & target_values.notna()
+            if int(overlap.sum()):
+                close = np.isclose(costs[overlap], target_values[overlap],
+                                   rtol=0.001, atol=2_000_000.0)
+                if not bool(close.all()):
+                    continue
+            out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+            changed.append(old_idx[1])
+            merged_existing = True
+            break
+        if merged_existing:
+            continue
+        # A same-member operating-expense row with materially different
+        # overlapping values proves that this disclosure is a distinct
+        # subtotal (for example, total costs versus other costs).  Do not
+        # consume that source row through the missing-member promotion path;
+        # later semantic arithmetic may use both rows to name them correctly.
+        if related_existing:
+            continue
+
+        revenue_rows = [idx for idx in out.index
+                        if idx[0] == '4a_Segments_Business'
+                        and _normalize_label_key(_split_segment_display_label(idx[1])[0]) == 'revenue'
+                        and _gb_duplicate_members_related(f'Revenue - {member}', idx[1])]
+        income_rows = [idx for idx in out.index
+                       if idx[0] == '4a_Segments_Business'
+                       and _normalize_label_key(_split_segment_display_label(idx[1])[0]) == 'operating income'
+                       and _gb_duplicate_members_related(f'Operating Income - {member}', idx[1])]
+        if not revenue_rows or not income_rows:
+            continue
+        canonical_member = None
+        for rev_idx in revenue_rows:
+            for income_idx in income_rows:
+                expected = (pd.to_numeric(out.loc[rev_idx], errors='coerce')
+                            - pd.to_numeric(out.loc[income_idx], errors='coerce'))
+                overlap = costs.notna() & expected.notna()
+                if int(overlap.sum()) < 3:
+                    continue
+                close = np.isclose(costs[overlap], expected[overlap],
+                                   rtol=0.001, atol=2_000_000.0)
+                if int(close.sum()) >= max(3, int(np.ceil(int(overlap.sum()) * 0.90))):
+                    canonical_member = _split_segment_display_label(rev_idx[1])[1]
+                    break
+            if canonical_member is not None:
+                break
+        if canonical_member is None:
+            continue
+        target = ('4a_Segments_Business', f'Operating Expenses - {canonical_member}')
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+        established.append(target)
+        changed.append(old_idx[1])
+    if changed:
+        print('  [Segment P&L] Promoted proven operating-expense row(s): '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+def _gb_relabel_proven_other_cost_subtotals(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename a generic operating-expense alias when arithmetic proves it.
+
+    ASC 280 supplemental tables may separately report employee compensation,
+    ``other costs and expenses``, and total costs and expenses.  Some XBRL
+    taxonomies label the middle subtotal generically as operating expenses.
+    Rename only when at least three periods prove:
+
+        generic subtotal + employee compensation = total costs and expenses
+
+    Values are never changed.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    rows = list(out.index)
+    by_member = defaultdict(dict)
+    for idx in rows:
+        cat, label = idx
+        metric, member = _split_segment_display_label(label)
+        if not member:
+            continue
+        by_member[_normalize_label_key(_gb_clean_member_footnote(member))][
+            _normalize_label_key(metric)] = idx
+
+    changed = []
+    for member_key, metrics in by_member.items():
+        generic = metrics.get('operating expense')
+        total = metrics.get('cost and expense') or metrics.get('total cost and expense')
+        employee = (metrics.get('salarie and employee benefit')
+                    or metrics.get('employee compensation'))
+        if not (generic and total and employee):
+            continue
+        generic_s = pd.to_numeric(out.loc[generic], errors='coerce')
+        employee_s = pd.to_numeric(out.loc[employee], errors='coerce')
+        total_s = pd.to_numeric(out.loc[total], errors='coerce')
+        overlap = generic_s.notna() & employee_s.notna() & total_s.notna()
+        if int(overlap.sum()) < 3:
+            continue
+        combined = generic_s[overlap] + employee_s[overlap]
+        if not np.isclose(
+                combined, total_s[overlap], rtol=0.0015,
+                atol=3_000_000.0).all():
+            continue
+        member = _split_segment_display_label(generic[1])[1]
+        target = (generic[0], f'Other Costs and Expenses - {member}')
+        out = _gb_rename_or_merge_pivot_row(out, generic, target)
+        changed.append(f'{generic[1]} -> {target[1]}')
+    if changed:
+        print('  [Semantic Gate] Proven subtotal relabel: '
+              + '; '.join(sorted(changed)))
+    return out
+
+
+def _gb_normalize_proven_segment_member_suffixes(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove presentation-only ``Operating`` suffixes with cross-metric proof."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    segment_rows = [idx for idx in out.index if idx[0] == '4a_Segments_Business']
+    base_members = defaultdict(set)
+    parsed = {}
+    for idx in segment_rows:
+        metric, member = _split_segment_display_label(idx[1])
+        parsed[idx] = (metric, member)
+        normalized = _normalize_label_key(_gb_clean_member_footnote(member))
+        if normalized and not normalized.endswith(' operating'):
+            base_members[normalized].add(_normalize_label_key(metric))
+
+    changed = []
+    for idx in list(segment_rows):
+        if idx not in out.index:
+            continue
+        metric, member = parsed[idx]
+        cleaned = _gb_clean_member_footnote(member).strip()
+        match = re.match(r'^(.*?)\s+Operating$', cleaned, re.I)
+        if not match:
+            continue
+        base = match.group(1).strip()
+        base_key = _normalize_label_key(base)
+        # Require a separate metric already using the unsuffixed participant.
+        if not base_members.get(base_key):
+            continue
+        if _normalize_label_key(metric) in base_members[base_key] and len(
+                base_members[base_key]) == 1:
+            continue
+        target = (idx[0], f'{metric} - {base}')
+        out = _gb_rename_or_merge_pivot_row(out, idx, target)
+        changed.append(f'{idx[1]} -> {target[1]}')
+    if changed:
+        print('  [Member Gate] Normalized presentation-only member suffixes: '
+              + '; '.join(sorted(changed)))
+    return out
+
+
+def _gb_reunify_reportable_segment_basis(df: pd.DataFrame) -> pd.DataFrame:
+    """Move geographic-looking revenue back to a proven business basis.
+
+    This is a final fail-safe for generic business axes.  A revenue member is
+    moved only when the same participant already has a business-segment profit
+    or expense metric, at least two such participants are stranded in geography,
+    and the business basis contains another revenue participant.  This avoids
+    issuer-specific names while keeping mixed axes together.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    core_metrics = {
+        'operating income', 'operating expense', 'contribution',
+        'segment profit', 'expense attributable to segment',
+        'depreciation and amortization',
+    }
+    business_members = set()
+    business_revenue_members = set()
+    for cat, label in out.index:
+        if cat != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(label)
+        member_key = _normalize_label_key(_gb_clean_member_footnote(member))
+        metric_key = _normalize_label_key(metric)
+        if metric_key in core_metrics and member_key:
+            business_members.add(member_key)
+        if metric_key == 'revenue' and member_key:
+            business_revenue_members.add(member_key)
+
+    candidates = []
+    for idx in out.index:
+        cat, label = idx
+        if cat not in {'4b_Segments_Geographic_Regions',
+                       '4c_Segments_Geographic_Countries'}:
+            continue
+        metric, member = _split_segment_display_label(label)
+        member_key = _normalize_label_key(_gb_clean_member_footnote(member))
+        if (_normalize_label_key(metric) == 'revenue'
+                and member_key in business_members):
+            candidates.append((idx, member_key))
+    candidate_members = {member for _, member in candidates}
+    if len(candidate_members) < 2:
+        return out
+    remaining_business_revenue = business_revenue_members - candidate_members
+    if not remaining_business_revenue:
+        return out
+    # A deliberate mixed-axis split keeps pure geographic revenue participants
+    # in geography while a non-geographic peer remains in business segments.
+    # Do not undo that stable final state on a later publication pass.
+    candidate_display_members = [
+        _split_segment_display_label(idx[1])[1] for idx, _ in candidates]
+    remaining_display_members = [
+        _split_segment_display_label(label)[1]
+        for cat, label in out.index
+        if cat == '4a_Segments_Business'
+        and _normalize_label_key(_split_segment_display_label(label)[0]) == 'revenue'
+        and _normalize_label_key(_gb_clean_member_footnote(
+            _split_segment_display_label(label)[1])) in remaining_business_revenue
+    ]
+    if (candidate_display_members
+            and all(_is_pure_geographic_label(member, False)
+                    for member in candidate_display_members)
+            and any(not _is_pure_geographic_label(member, False)
+                    for member in remaining_display_members)):
+        return out
+    changed = []
+    for old_idx, _member in candidates:
+        new_idx = ('4a_Segments_Business', old_idx[1])
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, new_idx)
+        changed.append(old_idx[1])
+    if changed:
+        print('  [Axis Gate] Reunified reportable-segment revenue basis: '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+
+
+def _gb_split_mixed_reportable_revenue_geography(df: pd.DataFrame) -> pd.DataFrame:
+    """Route geographic revenue members of a mixed reportable axis to 4b/4c.
+
+    The split is intentionally metric-specific.  A company may manage a mixed
+    reportable basis containing geographic participants and a non-geographic
+    business participant.  Revenue for the geographic participants is useful in
+    the geography section, while their operating expense/income and asset rows
+    remain business-segment measures.
+
+    Admission requires:
+      * at least two pure-geographic revenue participants currently in 4a;
+      * at least one non-geographic revenue participant remains in 4a; and
+      * every moved geography has a same-member business P&L support row.
+
+    All-geographic tables are untouched, so a complete regional reportable table
+    remains together.  Revenue-channel/product rows cannot satisfy the
+    same-member P&L support test.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    support_metrics = {
+        'operating income', 'operating expense',
+        'depreciation and amortization', 'segment profit',
+        'contribution', 'expense attributable to segment', 'assets',
+    }
+    member_support = defaultdict(set)
+    support_rows = []
+    geo_candidates = []
+    non_geo_revenue = []
+    for cat, label in out.index:
+        if cat != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(label)
+        metric_key = _normalize_label_key(metric)
+        member = _gb_clean_member_footnote(member).strip()
+        member_key = _normalize_label_key(member)
+        if not member_key:
+            continue
+        if metric_key in support_metrics:
+            member_support[member_key].add(metric_key)
+            support_rows.append((metric_key, f'{metric} - {member}'))
+        if metric_key != 'revenue':
+            continue
+        geo_kind = _classify_geographic_member(member, False)
+        if geo_kind is None:
+            non_geo_revenue.append((label, member_key))
+        else:
+            geo_candidates.append(((cat, label), member, member_key, geo_kind))
+    def _support_for(member):
+        probe = f'Revenue - {member}'
+        return {metric_key for metric_key, support_label in support_rows
+                if _gb_duplicate_members_related(probe, support_label)}
+
+    eligible = [item for item in geo_candidates
+                if len(_support_for(item[1])) >= 2]
+    if len({item[2] for item in eligible}) < 2 or not non_geo_revenue:
+        return out
+    geo_signatures = [_support_for(item[1]) for item in eligible]
+    common_signature = set.intersection(*map(set, geo_signatures)) if geo_signatures else set()
+    # The non-geographic peer must share a substantial same-table performance
+    # signature with the geographic participants.  This excludes coexisting
+    # product/service revenue bases that have only revenue/gross-profit detail.
+    peer_members = [member_key for label, member_key in non_geo_revenue
+                    if _classify_geographic_member(
+                        _split_segment_display_label(label)[1], False) is None]
+    qualified_peers = [member for label, member in non_geo_revenue
+                       if len(_support_for(
+                           _split_segment_display_label(label)[1])) >= 3
+                       and len(_support_for(
+                           _split_segment_display_label(label)[1])
+                               & common_signature) >= 3]
+    if not qualified_peers:
+        return out
+
+    changed = []
+    for old_idx, member, _member_key, geo_kind in eligible:
+        if old_idx not in out.index:
+            continue
+        canonical = _canonical_geographic_member_label(member, False)
+        target = (
+            '4c_Segments_Geographic_Countries'
+            if geo_kind == 'country'
+            else '4b_Segments_Geographic_Regions',
+            f'Revenue - {canonical}',
+        )
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+        changed.append(old_idx[1])
+    if changed:
+        print('  [Axis Gate] Split mixed reportable revenue geography: '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+
+def _gb_unify_complete_reportable_table_basis(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep every metric/member from one proven reportable table together.
+
+    A concept-level axis decision can split one table by metric: revenue may be
+    routed to business segments while cost/gross-profit/operating-income rows
+    using the same members remain in geography.  Reunify only with strong
+    cross-metric proof: at least three members already have business revenue and
+    at least two matching profitability/cost metrics in geography.  Any sibling
+    member carrying the same metric signature (for example a country caption in
+    an otherwise regional reportable table) joins the same basis.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    geo_cats = {
+        '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries',
+    }
+    # Some metrics from the same reportable table can be conservatively routed
+    # to disclosures before the final axis decision (for example a segment selling/marketing line).
+    # They may rejoin only through the complete cross-metric member signature
+    # below; unrelated disclosure rows cannot satisfy that proof.
+    candidate_cats = geo_cats | {'6_Disclosures'}
+    evidence_cats = candidate_cats | {'4a_Segments_Business'}
+    core_metrics = {
+        'cost of revenue', 'gross profit', 'operating income',
+        'sale and marketing', 'operating expense', 'other cost and expense',
+        'expense attributable to segment', 'contribution', 'segment profit',
+    }
+    business_revenue = set()
+    movable_rows = defaultdict(list)
+    member_metrics = defaultdict(set)
+    geo_revenue = set()
+
+    for idx in out.index:
+        cat, label = idx
+        metric, member = _split_segment_display_label(label)
+        member_key = _normalize_label_key(_gb_clean_member_footnote(member))
+        metric_key = _normalize_label_key(metric)
+        if not member_key:
+            continue
+        if cat == '4a_Segments_Business' and metric_key == 'revenue':
+            business_revenue.add(member_key)
+        if cat in candidate_cats and (metric_key == 'revenue'
+                                       or metric_key in core_metrics):
+            movable_rows[member_key].append(idx)
+            if metric_key == 'revenue' and cat in geo_cats:
+                geo_revenue.add(member_key)
+        # Evidence is intentionally broader than the rows still needing a
+        # move.  On a second/final publication pass, cost/gross-profit/operating
+        # income may already be in 4a while a late-created selling-and-marketing
+        # sibling remains in disclosures.  Existing 4a rows must continue to
+        # prove the complete table signature so the pass is idempotent.
+        if cat in evidence_cats and metric_key in core_metrics:
+            member_metrics[member_key].add(metric_key)
+
+    anchors = {
+        member for member in business_revenue
+        if len(member_metrics.get(member, set())) >= 2
+    }
+    if len(anchors) < 3:
+        return out
+
+    metric_frequency = defaultdict(int)
+    for member in anchors:
+        for metric in member_metrics[member]:
+            metric_frequency[metric] += 1
+    signature = {
+        metric for metric, count in metric_frequency.items()
+        if count >= max(2, int(np.ceil(len(anchors) * 0.60)))
+    }
+    if len(signature) < 2:
+        return out
+
+    members = {
+        member for member, metrics in member_metrics.items()
+        if len(metrics & signature) >= 2
+        and (member in business_revenue or member in geo_revenue)
+    }
+    if len(members) < 3 or not anchors.issubset(members):
+        return out
+
+    changed = []
+    for member in sorted(members):
+        for old_idx in list(movable_rows.get(member, ())):
+            if old_idx not in out.index:
+                continue
+            metric = _normalize_label_key(
+                _split_segment_display_label(old_idx[1])[0])
+            if metric != 'revenue' and metric not in signature:
+                continue
+            new_idx = ('4a_Segments_Business', old_idx[1])
+            out = _gb_rename_or_merge_pivot_row(out, old_idx, new_idx)
+            changed.append(old_idx[1])
+    if changed:
+        print('  [Axis Gate] Reunified complete reportable table basis: '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+_GB_UNSAFE_SEGMENT_ASSET_MEMBER_RE = re.compile(
+    r'\b(?:acquisition|intangible|property|equipment|finance\s+lease|'
+    r'capital\s+lease|held\s+for|held\s+under|useful\s+life|year|'
+    r'restatement|scenario|accounting\s+standard)\b', re.I)
+
+
+def _gb_promote_complete_segment_asset_basis(df: pd.DataFrame) -> pd.DataFrame:
+    """Move sibling direct asset balances into the proven segment-asset basis.
+
+    Some taxonomies put one participant (often a corporate/reconciliation
+    member) on a supplemental axis even though the same instant-balance table
+    reports it beside the operating segments.  Promote only when at least two
+    business asset series already establish the basis, the disclosure series
+    has repeated point-in-time coverage, and its member is not an asset class,
+    acquisition, lease or other accounting overlay.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    business_assets = []
+    for idx in out.index:
+        if idx[0] != '4a_Segments_Business' or not str(idx[1]).startswith('Assets - '):
+            continue
+        values = pd.to_numeric(out.loc[idx], errors='coerce')
+        if int(values.notna().sum()) >= 3:
+            business_assets.append(idx)
+    if len(business_assets) < 2:
+        return out
+
+    basis_columns = set()
+    for idx in business_assets:
+        values = pd.to_numeric(out.loc[idx], errors='coerce')
+        basis_columns.update(values.index[values.notna()].tolist())
+
+    changed = []
+    for old_idx in list(out.index):
+        if old_idx[0] != '6_Disclosures' or not str(old_idx[1]).startswith('Assets - '):
+            continue
+        member = _split_segment_display_label(old_idx[1])[1]
+        if not member or _GB_UNSAFE_SEGMENT_ASSET_MEMBER_RE.search(member):
+            continue
+        values = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        populated = set(values.index[values.notna()].tolist())
+        target = ('4a_Segments_Business', old_idx[1])
+        # An exact-label alias may fill missing historical periods when the
+        # canonical business row already exists.  A brand-new member still
+        # requires repeated overlapping balance coverage before promotion.
+        if target in out.index:
+            out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+            changed.append(old_idx[1])
+            continue
+        if not populated:
+            continue
+        if len(populated) < 3 or len(populated & basis_columns) < 3:
+            continue
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+        changed.append(old_idx[1])
+    if changed:
+        print('  [Asset Gate] Reunified complete segment-asset basis: '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+def _gb_reportable_segment_revenue_labels(df: pd.DataFrame, labels=None):
+    """Return revenue rows supported by another metric for the same member.
+
+    Revenue disaggregation can coexist with reportable segments in 4a.  A
+    member with operating income, contribution, attributable expenses, assets,
+    or another segment-level performance measure is much stronger evidence of
+    the additive reportable basis than a revenue-only product/channel row.
+    Acronym/expanded member aliases are treated as one participant only when the
+    existing generic alias relation recognizes them.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return []
+    if labels is None:
+        labels = [label for cat, label in df.index
+                  if cat == '4a_Segments_Business'
+                  and str(label).startswith('Revenue - ')]
+    support_metrics = {
+        'operating income', 'sale and marketing', 'operating expense',
+        'other cost and expense', 'cost of revenue', 'gross profit',
+        'contribution', 'segment profit',
+        'expense attributable to segment', 'other segment item', 'assets',
+        'depreciation and amortization',
+    }
+    support_labels = []
+    for cat, label in df.index:
+        if cat != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(label)
+        if _normalize_label_key(metric) in support_metrics and member:
+            support_labels.append(label)
+    result = []
+    for revenue_label in labels:
+        if any(_gb_duplicate_members_related(revenue_label, support_label)
+               for support_label in support_labels):
+            result.append(revenue_label)
+    return result if len(result) >= 2 else []
+
+
+def _gb_drop_fully_empty_segment_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove abandoned segment/disclosure labels with no published value."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    segment_like = set(SEG_CATS) | {OPERATING_METRICS_CATEGORY, '6_Disclosures'}
+    drop = []
+    for idx in df.index:
+        if idx[0] not in segment_like:
+            continue
+        values = pd.to_numeric(df.loc[idx], errors='coerce')
+        if values.notna().any():
+            continue
+        drop.append(idx)
+    if not drop:
+        return df
+    out = df.drop(index=drop).copy()
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    print(f'  [Publication Gate] Removed {len(drop)} fully empty segment row(s).')
+    return out
+
+
+
+def _gb_asset_period_columns(df: pd.DataFrame):
+    """Return {(year, quarter): column} for standard quarterly output columns."""
+    periods = {}
+    for column in df.columns:
+        match = re.fullmatch(r'(\d{4})-Q([1-4])', str(column))
+        if match:
+            periods[(int(match.group(1)), int(match.group(2)))] = column
+    return periods
+
+
+def _gb_remove_asset_capex_collisions(df: pd.DataFrame) -> pd.DataFrame:
+    """Blank asset cells that are demonstrably copied from capital additions.
+
+    This is a final fail-safe for source paths that lost provenance before the
+    pivot.  It requires repeated value equality between the same normalized
+    member's ``Assets`` and ``Capital Expenditures`` series; a one-period
+    coincidence is never enough.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    asset_rows = []
+    capex_rows = []
+    for idx in out.index:
+        metric, member = _split_segment_display_label(idx[1])
+        metric_key = _normalize_label_key(metric)
+        if metric_key == 'asset' and member and idx[0] in {
+                '4a_Segments_Business', '6_Disclosures'}:
+            asset_rows.append((idx, member))
+        elif (member and idx[0] in {'4a_Segments_Business', '6_Disclosures'}
+              and metric_key in {
+                  'capital expenditure', 'capital expenditures',
+                  'total net addition to property and equipment',
+                  'net addition to property and equipment'}):
+            capex_rows.append((idx, member))
+    if not asset_rows or not capex_rows:
+        return out
+
+    cleared = []
+    for asset_idx, asset_member in asset_rows:
+        asset_values = pd.to_numeric(out.loc[asset_idx], errors='coerce')
+        matching_capex = []
+        for capex_idx, capex_member in capex_rows:
+            if _gb_duplicate_members_related(
+                    f'Assets - {asset_member}',
+                    f'Assets - {capex_member}'):
+                matching_capex.append(capex_idx)
+        if not matching_capex:
+            continue
+        collision_mask = pd.Series(False, index=out.columns)
+        matching_periods = 0
+        for capex_idx in matching_capex:
+            capex_values = pd.to_numeric(out.loc[capex_idx], errors='coerce')
+            overlap = asset_values.notna() & capex_values.notna()
+            if not overlap.any():
+                continue
+            tolerance = pd.concat(
+                [asset_values.abs(), capex_values.abs()], axis=1
+            ).max(axis=1).mul(0.001).clip(lower=2_000_000.0)
+            equal = overlap & ((asset_values - capex_values).abs() <= tolerance)
+            matching_periods += int(equal.sum())
+            collision_mask |= equal
+        if matching_periods < 2:
+            continue
+        if collision_mask.any():
+            out.loc[asset_idx, collision_mask.index[collision_mask]] = np.nan
+            cleared.append(
+                f"{asset_idx[1]} ({int(collision_mask.sum())} period(s))")
+    if cleared:
+        print('  [Asset Gate] Removed capital-addition values from asset series: '
+              + ', '.join(cleared))
+    return out
+
+
+def _gb_repair_instant_asset_quarter_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """Repair repeated scale/cumulative signatures in point-in-time asset rows.
+
+    Two independent, repeated signatures are handled:
+      1. Q4 values printed 1,000x or 1,000,000x below adjacent instant balances.
+      2. Q4 values equal to a sum of quarterly instant balances.
+
+    Requiring the same signature in at least two fiscal years prevents a single
+    genuine acquisition or disposal from being rewritten.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    periods = _gb_asset_period_columns(df)
+    if not periods:
+        return df
+    out = df.copy()
+    repaired = []
+
+    for idx in list(out.index):
+        if idx[0] not in {'4a_Segments_Business', '6_Disclosures'}:
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) != 'asset' or not member:
+            continue
+        series = pd.to_numeric(out.loc[idx], errors='coerce').copy()
+
+        # Stage 1: repeated under-scale signature.
+        scale_flags = defaultdict(list)
+        years = sorted({year for year, quarter in periods if quarter == 4})
+        for year in years:
+            q4_col = periods.get((year, 4))
+            if q4_col is None or pd.isna(series.get(q4_col)):
+                continue
+            q4 = float(series[q4_col])
+            if not np.isfinite(q4) or q4 <= 0:
+                continue
+            refs = []
+            for q in (1, 2, 3):
+                col = periods.get((year, q))
+                if col is not None and pd.notna(series.get(col)):
+                    refs.append(float(series[col]))
+            next_q1 = periods.get((year + 1, 1))
+            if next_q1 is not None and pd.notna(series.get(next_q1)):
+                refs.append(float(series[next_q1]))
+            refs = [value for value in refs if np.isfinite(value) and value > 0]
+            if not refs:
+                continue
+            reference = float(np.median(refs))
+            if q4 >= reference * 0.02:
+                continue
+            best = None
+            for multiplier in (1_000.0, 1_000_000.0):
+                corrected = q4 * multiplier
+                ratio = corrected / reference
+                if not (0.25 <= ratio <= 4.0):
+                    continue
+                error = abs(np.log(max(ratio, 1e-300)))
+                if best is None or error < best[0]:
+                    best = (error, multiplier, corrected)
+            if best is not None:
+                scale_flags[best[1]].append((year, q4_col, best[2]))
+        for multiplier, items in scale_flags.items():
+            if len(items) < 2:
+                continue
+            for year, column, corrected in items:
+                series[column] = corrected
+                repaired.append(
+                    f"{idx[1]} {year}-Q4 x{int(multiplier):,}")
+
+        # Stage 2: repeated cumulative-instant signature.
+        cumulative_flags = []
+        for year in years:
+            cols = [periods.get((year, q)) for q in (1, 2, 3, 4)]
+            if any(column is None for column in cols):
+                continue
+            values = [series.get(column) for column in cols]
+            if any(pd.isna(value) for value in values):
+                continue
+            q1, q2, q3, q4 = map(float, values)
+            reference = float(np.median([q1, q2, q3]))
+            if reference <= 0 or q4 <= 2.5 * reference:
+                continue
+            residual = q4 - q1 - q2 - q3
+            ratio = residual / reference if reference else np.nan
+            if np.isfinite(residual) and residual > 0 and 0.25 <= ratio <= 2.5:
+                cumulative_flags.append((year, cols[3], residual))
+        if len(cumulative_flags) >= 2:
+            repaired_years = {year for year, _, _ in cumulative_flags}
+            for year, column, residual in cumulative_flags:
+                series[column] = residual
+                repaired.append(f"{idx[1]} {year}-Q4 de-cumulated")
+            # If the same row repeatedly carried annual sums, an older Q4 with
+            # no Q1-Q3 support cannot be safely reconstructed.  Quarantine it
+            # when it has the same ~4x point-in-time signature.
+            for year in years:
+                if year in repaired_years:
+                    continue
+                q4_col = periods.get((year, 4))
+                next_q1_col = periods.get((year + 1, 1))
+                if q4_col is None or next_q1_col is None:
+                    continue
+                q4 = series.get(q4_col)
+                next_q1 = series.get(next_q1_col)
+                if pd.isna(q4) or pd.isna(next_q1) or float(next_q1) <= 0:
+                    continue
+                quarter_support = sum(
+                    pd.notna(series.get(periods.get((year, q))))
+                    for q in (1, 2, 3)
+                    if periods.get((year, q)) is not None)
+                if quarter_support >= 3:
+                    continue
+                ratio = float(q4) / float(next_q1)
+                if 2.5 <= ratio <= 5.5:
+                    series[q4_col] = np.nan
+                    repaired.append(f"{idx[1]} {year}-Q4 quarantined")
+
+        out.loc[idx, :] = series.values
+
+    if repaired:
+        print('  [Asset Gate] Repaired instant-asset quarter anomaly(s): '
+              + ', '.join(repaired))
+    return out
+
+
+def _gb_merge_asset_footnote_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge harmless asset-member presentation aliases.
+
+    Covers SEC footnote suffixes (``China (a)``) and terminal taxonomy artifacts
+    such as ``Corporate Non`` / ``Corporate Nonsegment``.  Only value-compatible
+    aliases in the same output category are combined.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    groups = defaultdict(list)
+    for idx in out.index:
+        if idx[0] not in {'4a_Segments_Business', '6_Disclosures'}:
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) != 'asset' or not member:
+            continue
+        clean_member = _gb_clean_member_footnote(member)
+        clean_member = re.sub(
+            r'\s+(?:non|nonsegment)$', '', clean_member, flags=re.I).strip()
+        groups[(idx[0], _normalize_label_key(clean_member))].append(
+            (idx, clean_member))
+    changed = []
+    for (category, _), items in groups.items():
+        def rank(item):
+            idx, clean_member = item
+            values = pd.to_numeric(out.loc[idx], errors='coerce')
+            original_member = _split_segment_display_label(idx[1])[1]
+            exact_clean = int(original_member == clean_member)
+            return (int(values.notna().sum()), exact_clean, -len(idx[1]))
+        target_idx, clean_member = max(items, key=rank)
+        merged = pd.to_numeric(out.loc[target_idx], errors='coerce').copy()
+        donors = []
+        conflict = False
+        for donor_idx, _ in items:
+            if donor_idx == target_idx:
+                continue
+            donor = pd.to_numeric(out.loc[donor_idx], errors='coerce')
+            overlap = merged.notna() & donor.notna()
+            if overlap.any():
+                tolerance = pd.concat([merged.abs(), donor.abs()], axis=1).max(
+                    axis=1).mul(0.001).clip(lower=2_000_000.0)
+                if not bool(((merged - donor).abs()[overlap]
+                             <= tolerance[overlap]).all()):
+                    conflict = True
+                    break
+            merged = merged.combine_first(donor)
+            donors.append(donor_idx)
+        if conflict:
+            continue
+        canonical_idx = (category, f'Assets - {clean_member}')
+        source_indices = [idx for idx, _ in items]
+        # A single malformed suffix still needs a rename.
+        if len(source_indices) == 1 and source_indices[0] == canonical_idx:
+            continue
+        for old_idx in source_indices:
+            if old_idx in out.index:
+                out = out.drop(index=old_idx)
+        if canonical_idx in out.index:
+            existing = pd.to_numeric(out.loc[canonical_idx], errors='coerce')
+            merged = existing.combine_first(merged)
+        out.loc[canonical_idx, :] = merged.values
+        changed.append(canonical_idx[1])
+    if changed:
+        print('  [Asset Alias] Normalized asset member alias(es): '
+              + ', '.join(sorted(changed)))
+    return out
+
+
+def _gb_suppress_unproven_segment_footing_diagnostics(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Remove false segment-footing conclusions for revenue-only disaggregation.
+
+    Without a second segment-level metric for the same members, revenue rows can
+    be product/channel disclosures rather than an additive reportable basis.
+    Such cases should publish no conclusion, not a mismatch.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    revenue_labels = [
+        label for category, label in df.index
+        if category == '4a_Segments_Business'
+        and str(label).startswith('Revenue - ')
+        and str(label).count(' - ') == 1
+    ]
+    if not revenue_labels:
+        return df
+    if len(_gb_reportable_segment_revenue_labels(df, revenue_labels)) >= 2:
+        return df
+    out = df.copy()
+    labels = (
+        'Metric: Segment Revenue Footing Verified',
+        'Metric: Segment Revenue Footing Basis Code',
+        'Metric: Segment Revenue Footing Error %',
+        'Metric: Segment Sum Verified (Revenue)',
+    )
+    removed = []
+    for label in labels:
+        idx = ('8_Integrity_Checks', label)
+        if idx in out.index:
+            out = out.drop(index=idx)
+            removed.append(label)
+    if removed:
+        print('  [Integrity] Suppressed unproven segment-revenue footing conclusion.')
+    return out
+
+
+
+
+def _gb_reclassify_significant_expense_details(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Keep filed significant expenses out of Other Items and KPI categories."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    changed = []
+    dropped = []
+    for idx in list(out.index):
+        if idx not in out.index:
+            continue
+        category, label = idx
+        text = str(label or '')
+        if category == '4e_Operating_Metrics' and text.startswith('Operating Measure - '):
+            source = text.split(' - ', 1)[1].strip()
+            if _GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(source):
+                out = out.drop(index=idx)
+                dropped.append(text)
+            continue
+        if category != '4a_Segments_Business' or not text.startswith('Other Segment Items - '):
+            continue
+        tail = text.split(' - ')[1:]
+        if not tail:
+            continue
+        detail = tail[-1]
+        if not _GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(detail):
+            continue
+        canonical_detail = _gb_canonical_expense_detail(detail)
+        if len(tail) == 1:
+            target_label = f'Significant Segment Expenses - {canonical_detail}'
+        else:
+            target_label = ('Significant Segment Expenses - '
+                            + ' - '.join(tail[:-1] + [canonical_detail]))
+        out = _gb_rename_or_merge_pivot_row(
+            out, idx, ('4a_Segments_Business', target_label))
+        changed.append(f'{text} -> {target_label}')
+    if changed:
+        print('  [Expense Gate] Reclassified significant-expense detail(s): '
+              + '; '.join(sorted(changed)))
+    if dropped:
+        print('  [Operating Metric Gate] Removed accounting expense KPI row(s): '
+              + ', '.join(sorted(dropped)))
+    return out
+
+
+def _gb_reconcile_company_defined_segment_measure_aliases(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Resolve false accounting labels only when a filed measure proves them.
+
+    A correct company-defined row must already exist.  A same-member
+    Depreciation or Other Segment Items row is removed/merged only when repeated
+    overlapping values agree, so legitimate depreciation and other-item rows are
+    never renamed from wording alone.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    removed = []
+    # An accounting measure cannot be a revenue member.
+    for idx in list(out.index):
+        if idx[0] == '4a_Segments_Business' and re.fullmatch(
+                r'Revenue\s+-\s+(?:Adjusted\s+)?(?:Segment\s+)?EBITDA',
+                str(idx[1]), re.I):
+            out = out.drop(index=idx)
+            removed.append(idx[1])
+
+    for idx in list(out.index):
+        if idx not in out.index or idx[0] != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) != 'adjusted segment ebitda' or not member:
+            continue
+        target = idx
+        target_values = pd.to_numeric(out.loc[target], errors='coerce')
+        for wrong_metric in ('Depreciation', 'Depreciation & Amortization'):
+            wrong = ('4a_Segments_Business', f'{wrong_metric} - {member}')
+            if wrong not in out.index:
+                continue
+            wrong_values = pd.to_numeric(out.loc[wrong], errors='coerce')
+            overlap = target_values.notna() & wrong_values.notna()
+            if int(overlap.sum()) < 2:
+                continue
+            tolerance = pd.concat(
+                [target_values.abs(), wrong_values.abs()], axis=1
+            ).max(axis=1).mul(0.001).clip(lower=2_000_000.0)
+            if not bool(((target_values - wrong_values).abs()[overlap]
+                         <= tolerance[overlap]).all()):
+                continue
+            merged = target_values.combine_first(wrong_values)
+            out.loc[target, :] = merged.values
+            out = out.drop(index=wrong)
+            target_values = merged
+            removed.append(f'{wrong[1]} -> {target[1]}')
+
+        correct_other = ('4a_Segments_Business',
+                         f'Significant Segment Expenses - {member} - Other')
+        old_other = ('4a_Segments_Business', f'Other Segment Items - {member}')
+        if correct_other in out.index and old_other in out.index:
+            correct = pd.to_numeric(out.loc[correct_other], errors='coerce')
+            old = pd.to_numeric(out.loc[old_other], errors='coerce')
+            overlap = correct.notna() & old.notna()
+            if int(overlap.sum()) >= 1:
+                tolerance = pd.concat([correct.abs(), old.abs()], axis=1).max(
+                    axis=1).mul(0.001).clip(lower=2_000_000.0)
+                if bool(((correct - old).abs()[overlap] <= tolerance[overlap]).all()):
+                    out.loc[correct_other, :] = correct.combine_first(old).values
+                    out = out.drop(index=old_other)
+                    removed.append(f'{old_other[1]} -> {correct_other[1]}')
+    if removed:
+        print('  [Segment Measure Gate] Resolved proven metric-label conflict(s): '
+              + '; '.join(sorted(removed)))
+    return out
+
+
+def _gb_drop_nonmonetary_asset_disclosures(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove useful-life/period fractions that inherited an Assets prefix."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    dropped = []
+    clue = re.compile(
+        r'\b(?:patents?|developed\s+technology|useful\s+life|lives|'
+        r'individually\s+immaterial\s+business\s+acquisitions?)\b', re.I)
+    for idx in list(out.index):
+        if idx[0] not in {'4a_Segments_Business', '6_Disclosures'}:
+            continue
+        if not str(idx[1]).startswith('Assets - ') or not clue.search(str(idx[1])):
+            continue
+        values = pd.to_numeric(out.loc[idx], errors='coerce').dropna()
+        if values.empty:
+            continue
+        fractional = (values - values.round()).abs() > 1e-8
+        if values.abs().max() <= 100 and fractional.any():
+            out = out.drop(index=idx)
+            dropped.append(idx[1])
+    if dropped:
+        print('  [Asset Gate] Removed nonmonetary asset-label disclosure(s): '
+              + ', '.join(sorted(dropped)))
+    return out
+
+def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
+    """Idempotent output-boundary safety pass for fresh and cached pivots."""
+    if df is None or df.empty:
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = _gb_repair_discrete_q4_operating_openings(df)
+    out = _gb_consolidate_pivot_operating_gain_loss_rows(out)
+    out = _gb_reunify_reportable_segment_basis(out)
+    out = _gb_unify_complete_reportable_table_basis(out)
+    out = _gb_promote_proven_segment_operating_expenses(out)
+    out = _gb_split_mixed_reportable_revenue_geography(out)
+    out = _gb_promote_complete_segment_asset_basis(out)
+    out = _gb_remove_asset_capex_collisions(out)
+    out = _gb_repair_instant_asset_quarter_anomalies(out)
+    out = _gb_merge_asset_footnote_aliases(out)
+    out = _gb_relabel_proven_other_cost_subtotals(out)
+    out = _gb_normalize_proven_segment_member_suffixes(out)
+    out = _gb_reclassify_significant_expense_details(out)
+    out = _gb_reconcile_company_defined_segment_measure_aliases(out)
+    out = _gb_consolidate_pivot_segment_duplicates(out)
+    out = _gb_drop_invalid_asset_series_from_pivot(out)
+    out = _gb_drop_nonmonetary_asset_disclosures(out)
+    out = _gb_suppress_unproven_segment_footing_diagnostics(out)
+    out = _gb_drop_fully_empty_segment_rows(out)
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_prefer_instant_segment_asset_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duration candidates when a direct instant asset fact is available."""
+    required = {'Category', 'Label', 'FY', 'Q', 'End', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    asset_mask = (
+        out['Category'].isin({'4a_Segments_Business', '6_Disclosures'})
+        & out['Label'].fillna('').astype(str).str.startswith('Assets - ')
+    )
+    assets = out.loc[asset_mask]
+    if assets.empty:
+        return out
+    drop = []
+    keys = ['Category', 'Label', 'FY', 'Q', 'End']
+    for _, group in assets.groupby(keys, dropna=False, sort=False):
+        basis = group.get(
+            'SourcePeriodBasis', pd.Series('', index=group.index)
+        ).fillna('').astype(str)
+        kind = group.get(
+            'SourceAssetMetricKind', pd.Series('', index=group.index)
+        ).fillna('').astype(str)
+        duration = pd.to_numeric(group['Duration'], errors='coerce').fillna(0)
+        instant = (basis.eq(_GB_BASIS_INSTANT_END)
+                   | kind.eq('balance') | duration.eq(0))
+        if not instant.any():
+            continue
+        drop.extend(group.index[~instant].tolist())
+    if drop:
+        out = out.drop(index=drop)
+        print(f'  [Asset Gate] Preferred direct instant balance over '
+              f'{len(drop)} duration asset candidate(s).')
+    return out
+
+
+def _gb_asset_member_identity(label: str) -> str:
+    metric, member = _split_segment_display_label(label)
+    if _normalize_label_key(metric) != 'asset':
+        return ''
+    member = _gb_clean_member_footnote(member)
+    member = re.sub(r'\s+(?:non|nonsegment)$', '', member, flags=re.I).strip()
+    return _normalize_label_key(member)
+
+
+def _gb_prefer_complete_instant_asset_table_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Prefer a complete direct instant asset table over isolated candidates."""
+    required = {'Category', 'Label', 'FY', 'Q', 'End', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    labels = out['Label'].fillna('').astype(str)
+    basis = out.get('SourcePeriodBasis', pd.Series('', index=out.index)).fillna('').astype(str)
+    roles = out.get('SourceTableRole', pd.Series('', index=out.index)).fillna('').astype(str)
+    fingerprints = out.get('SourceTableFingerprint', pd.Series('', index=out.index)).fillna('').astype(str)
+    metric_identity = out.get(
+        'SourceMetricIdentity', pd.Series('', index=out.index)
+    ).fillna('').astype(str)
+    values = pd.to_numeric(out['Value'], errors='coerce')
+    valid_identity = metric_identity.eq('') | metric_identity.isin({
+        'ending_segment_assets', 'geographic_long_lived_assets',
+        'geographic_asset_balance'})
+    mask = (
+        labels.str.startswith('Assets - ')
+        & basis.eq(_GB_BASIS_INSTANT_END)
+        & roles.isin({_GB_ROLE_SEGMENT_ASSETS, _GB_ROLE_GEOGRAPHIC_ASSETS})
+        & valid_identity
+        & fingerprints.str.strip().ne('')
+        & values.notna() & values.ge(0)
+    )
+    candidates = out.loc[mask].copy()
+    if candidates.empty:
+        return out
+    candidates['_GBMember'] = candidates['Label'].map(_gb_asset_member_identity)
+    candidates = candidates[candidates['_GBMember'].ne('')]
+    if candidates.empty:
+        return out
+    group_keys = [key for key in (
+        'Accession', 'SourceTableFingerprint', 'SourceTableRole',
+        'SourceMetricIdentity', 'FY', 'Q', 'End'
+    ) if key in candidates.columns]
+    if not group_keys:
+        return out
+    choices_by_period = defaultdict(list)
+    for _, group in candidates.groupby(group_keys, dropna=False, sort=False):
+        role = str(group['SourceTableRole'].iloc[0])
+        minimum = 3 if role == _GB_ROLE_SEGMENT_ASSETS else 2
+        member_count = group['_GBMember'].nunique()
+        if member_count < minimum:
+            continue
+        confidence = pd.to_numeric(group.get(
+            'SourceClassificationConfidence', pd.Series(0.0, index=group.index)),
+            errors='coerce').fillna(0.0).mean()
+        source_kinds = group.get(
+            'SourceKind', pd.Series('', index=group.index)).astype(str)
+        atomic_bonus = int(source_kinds.eq('xbrl_atomic_group').any())
+        html_bonus = int(source_kinds.eq('html_table').any())
+        period_key = (role, str(group['FY'].iloc[0]), str(group['Q'].iloc[0]),
+                      str(group['End'].iloc[0]))
+        choices_by_period[period_key].append(
+            (member_count, atomic_bonus, html_bonus, confidence, group.copy()))
+    if not choices_by_period:
+        return out
+
+    drop = set()
+    relabel = {}
+    for _, choices in choices_by_period.items():
+        _, _, _, _, winner = max(
+            choices, key=lambda item: (item[0], item[1], item[2], item[3]))
+        role = str(winner['SourceTableRole'].iloc[0])
+        winner_members = set(winner['_GBMember'])
+        winner_labels = list(winner['Label'].astype(str))
+        winner_indices = set(winner.index)
+        fy = winner['FY'].iloc[0]; q = winner['Q'].iloc[0]; end = winner['End'].iloc[0]
+        for idx, row in winner.iterrows():
+            member = _split_segment_display_label(row['Label'])[1]
+            clean_member = re.sub(r'\s+(?:non|nonsegment)$', '',
+                                  _gb_clean_member_footnote(member), flags=re.I).strip()
+            relabel[idx] = (
+                '4a_Segments_Business' if role == _GB_ROLE_SEGMENT_ASSETS else row['Category'],
+                f'Assets - {clean_member}',
+            )
+        period_mask = (
+            pd.to_numeric(out['FY'], errors='coerce').eq(
+                pd.to_numeric(pd.Series([fy]), errors='coerce').iloc[0])
+            & out['Q'].astype(str).eq(str(q))
+            & out['End'].astype(str).eq(str(end))
+            & out['Label'].fillna('').astype(str).str.startswith('Assets - ')
+        )
+        for idx, row in out.loc[period_mask].iterrows():
+            if idx in winner_indices:
+                continue
+            if (_gb_asset_member_identity(row['Label']) in winner_members
+                    or any(_gb_duplicate_members_related(
+                        str(row['Label']), winner_label)
+                        for winner_label in winner_labels)):
+                drop.add(idx)
+    if drop:
+        out = out.drop(index=list(drop))
+    for idx, (category, label) in relabel.items():
+        if idx not in out.index:
+            continue
+        out.at[idx, 'Category'] = category
+        out.at[idx, 'Label'] = label
+        if 'SourceAdmissionRule' in out.columns:
+            out.at[idx, 'SourceAdmissionRule'] = 'complete_direct_instant_asset_table'
+        if 'SourceMetricIdentity' in out.columns:
+            out.at[idx, 'SourceMetricIdentity'] = (
+                'ending_segment_assets'
+                if role == _GB_ROLE_SEGMENT_ASSETS
+                else 'geographic_long_lived_assets')
+    if drop or relabel:
+        print(f'  [Asset Gate] Preferred complete instant asset table; '
+              f'removed {len(drop)} competing candidate(s).')
+    return out
+
+
+def _gb_drop_invalid_asset_series_from_pivot(df: pd.DataFrame) -> pd.DataFrame:
+    """Publication gate for impossible segment/geographic asset balances."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    for idx in list(out.index):
+        cat, label = idx
+        if cat not in {'4a_Segments_Business', '6_Disclosures'}:
+            continue
+        if not str(label).startswith('Assets - '):
+            continue
+        values = pd.to_numeric(out.loc[idx], errors='coerce')
+        bad = values < 0
+        if bad.any():
+            out.loc[idx, bad.index[bad]] = np.nan
+            print(f"  [Asset Gate] Removed negative derived asset balance(s): {label}")
+    return out
+
+
 def build_pivoted_data(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     with _ProfileTimer("build_pivoted_data_total"):
         return _build_pivoted_data_impl(
@@ -11050,6 +15136,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     df = df.dropna(subset=['Value'])
     df = _gb_prepare_operating_measure_facts(df)
+    df = _gb_quarantine_conflicting_semantic_duplicates(df)
     def normalize_segment_label(label):
         parts = label.split(' - ')
         if len(parts) > 1:
@@ -11076,9 +15163,18 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df['Label'] = df['Label'].map(lambda _lbl: _label_norm_map.get(_lbl, _lbl))
     df = _reconcile_segment_labels(df, ticker=ticker, company_name=company_name)
     df = _detect_and_merge_renamed_segments(df)
+    df = _gb_promote_proven_segment_disclosure_history(df)
     df = _merge_concurrent_member_variants(df)
+    # Re-run after label-era reconciliation: several false rows are only
+    # recognizable once old/new member names have been canonicalized.
+    df = _gb_quarantine_conflicting_semantic_duplicates(df)
     df = _consolidate_geographic_alias_facts(df)
     df = _gb_reconcile_operating_metric_identities(df)
+    # Operating-alias reconciliation can create final canonical labels; apply
+    # the semantic duplicate gate once more before candidate selection.
+    df = _gb_quarantine_conflicting_semantic_duplicates(df)
+    df = _gb_prefer_instant_segment_asset_candidates(df)
+    df = _gb_prefer_complete_instant_asset_table_candidates(df)
     # Keep the audit separately.  A DataFrame stored inside ``DataFrame.attrs``
     # makes pandas concat attempt element-wise DataFrame equality when it
     # reconciles attrs from the operating/non-operating slices, which raises
@@ -11660,7 +15756,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
     _CUMULATIVE_ASPECT_FIELDS = (
         'DimCount', 'DimensionSignature', 'SourceUnitSignature',
-        'SourceUnitKind', 'Unit',
+        'SourceUnitKind', 'Unit', 'SourcePeriodBasis', 'SourceSemanticType',
+        'SourceTableRole', 'SourceAnalyticalBasis',
     )
 
     def _normalized_aspect_value(value):
@@ -12001,7 +16098,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _duration_filter_cache.clear()
         _concept_resolve_cache.clear()
         _best_val_cache.clear()
-        operating_period_basis = _gb_group_operating_period_basis(group)
+        operating_period_basis = _gb_group_period_basis(group)
         is_operating_average = operating_period_basis in {
             _GB_BASIS_AVERAGE, _GB_BASIS_RATIO,
         }
@@ -12018,19 +16115,14 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         if is_bs or 'Useful Life' in label or 'RPO' in label:
             q_src = {qn: get_best_val(qn, 0, 15) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
         elif operating_period_basis == _GB_BASIS_INSTANT_END:
-            # HTML snapshot facts retain the table header's nominal duration,
-            # but semantically they are point-in-time balances.  Use direct
-            # quarter values and the final annual year-end snapshot for Q4.
-            q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3']}
-            q4_val = get_best_val('Q4', 365, 50)
-            if q4_val is None:
-                q4_val = get_best_val('Q4', 91, 40)
-            q_src['Q4'] = q4_val
+            # Point-in-time facts are selected only from instant contexts.  A
+            # year-end 10-K balance is Q4 directly; it is never Annual-Q1-Q2-Q3.
+            q_src = {qn: get_best_val(qn, 0, 15)
+                     for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
         elif operating_period_basis == _GB_BASIS_INSTANT_START:
-            # A 365-day beginning balance is the beginning of the fiscal year,
-            # not Q4.  Direct quarter facts are selected first; continuity may
-            # fill a missing value only for a quarter already present in source.
-            q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
+            # A beginning balance is an instant, not a flow.
+            q_src = {qn: get_best_val(qn, 0, 15)
+                     for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
         elif operating_period_basis == _GB_BASIS_UNKNOWN:
             q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
         elif is_avg:
@@ -12444,9 +16536,12 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     except (TypeError, ValueError):
                         continue
                 for qn in ('Q1', 'Q2', 'Q3', 'Q4'):
-                    if (q_vals.get(qn) is not None
-                            or (int(fy), qn) not in _family_source_periods
-                            or (int(fy), qn) not in _operating_source_periods):
+                    period_exists = (
+                        (int(fy), qn) in _family_source_periods
+                        and (int(fy), qn) in _operating_source_periods)
+                    replace_annual_q4_opening = (qn == 'Q4' and period_exists)
+                    if ((q_vals.get(qn) is not None and not replace_annual_q4_opening)
+                            or not period_exists):
                         continue
                     previous_end = _gb_previous_operating_end_fact(
                         df, cat, metric_family, fy, qn)
@@ -13001,12 +17096,14 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_pivot = _validate_and_repair_segment_data(final_pivot)
     final_pivot = _null_segment_total_leaks(final_pivot)
     final_pivot = _merge_prefix_continuation_members(final_pivot)
+    final_pivot = _gb_consolidate_pivot_segment_duplicates(final_pivot)
     final_pivot = _audit_segment_footing(final_pivot, ticker, ye_month)
     final_pivot = _derive_crosstabulated_matrix(final_pivot)
     final_pivot = _repair_always_positive(final_pivot)
     final_pivot = _repair_q4_from_annual_ytd(final_pivot)
     final_pivot = _remerge_false_positive_splits(final_pivot)
     final_pivot = _neutralize_ytd_undercapture(final_pivot)
+    final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
     final_pivot = _recompute_cf_residuals(final_pivot)
     final_pivot = _refresh_balance_sheet_closure(final_pivot)
     final_pivot = _gb_add_operating_integrity_checks(final_pivot, fact_audit)
@@ -13398,32 +17495,12 @@ def _apply_accounting_engine(df, is_financial=False, is_insurance=False, is_oil_
                 set_v('3_Cash_Flow', 'Net Income (CF)', col, ni)
             
             # --- PHASE 4: SEGMENTS ---
-            if rev is not None and biz_segs:
-                known_seg_vals = []
-                missing_segs = []
-                for s in biz_segs:
-                    v = get_v('4a_Segments_Business', s, col)
-                    if v is not None: known_seg_vals.append(v)
-                    else: missing_segs.append(s)
-                
-                if len(missing_segs) == 1:
-                    missing_val = rev - sum(known_seg_vals)
-                    if missing_val >= 0:
-                        set_v('4a_Segments_Business', missing_segs[0], col, missing_val)
-
-            if biz_segs:
-                for s in biz_segs:
-                    base = s.replace('Revenue - ', '')
-                    seg_rev = get_v('4a_Segments_Business', s, col)
-                    seg_opinc = get_v('4a_Segments_Business', f'Operating Income - {base}', col)
-                    seg_opex = get_v('4a_Segments_Business', f'Operating Expenses - {base}', col)
-                    
-                    if seg_opex is None and seg_rev is not None and seg_opinc is not None:
-                        set_v('4a_Segments_Business', f'Operating Expenses - {base}', col, seg_rev - seg_opinc)
-                    elif seg_opinc is None and seg_rev is not None and seg_opex is not None:
-                        set_v('4a_Segments_Business', f'Operating Income - {base}', col, seg_rev - seg_opex)
-                    elif seg_rev is None and seg_opinc is not None and seg_opex is not None:
-                        set_v('4a_Segments_Business', f'Revenue - {base}', col, seg_opinc + seg_opex)
+            # No broad segment arithmetic is performed here.  Final display rows
+            # no longer carry enough row-level source semantics to prove that
+            # ``Other Segment Items`` or ``Contribution`` equals total operating
+            # expenses/income.  Only the separate empirically validated revenue-
+            # partition repair may fill a missing revenue member.
+            pass
 
     return df
 
@@ -14814,8 +18891,21 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
     if len(seg_labels) >= 2:
         total = row('1_Income_Statement', 'Revenue')
         seg_rows = {lbl: pd.to_numeric(df.loc[('4a_Segments_Business', lbl)], errors='coerce') for lbl in seg_labels}
+        # Resolve the analytical basis once from the complete row inventory.
+        # Re-running basis discovery on only the rows populated in one quarter
+        # can fall back to a product/channel subset when the reportable table is
+        # absent for that period, creating a false footing error (for example a discrete Q4).
+        reportable_basis = _gb_reportable_segment_revenue_labels(df, seg_labels)
         def basis_groups(labels):
             groups = []
+            if len(reportable_basis) >= 2:
+                present_reportable = [l for l in reportable_basis if l in labels]
+                if len(present_reportable) >= 2:
+                    groups.append(present_reportable)
+                # A proven reportable basis exists globally.  Do not substitute
+                # a different product/service basis merely because the filing
+                # omitted reportable rows for this particular quarter.
+                return groups
             groups.append(labels)
             for marker in ('(Post Change)', '(Pre Change)'):
                 g = [l for l in labels if marker.lower() in l.lower()]
@@ -15547,6 +19637,13 @@ def _audit_segment_footing(df, ticker, ye_month):
 
         if not seg_labels:
             continue
+        if cat == '4a_Segments_Business':
+            supported_labels = _gb_reportable_segment_revenue_labels(
+                df, [label for _cat, label in seg_labels])
+            if len(supported_labels) >= 2:
+                supported_set = set(supported_labels)
+                seg_labels = [(c, label) for c, label in seg_labels
+                              if label in supported_set]
 
         for q_col in df.columns:
             if pd.isna(rev_n[q_col]) or rev_n[q_col] == 0: continue
@@ -22284,7 +26381,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-18.native-extraction.v13-bs-instant-disclosure-semantics"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-19.native-extraction.v20-atomic-segment-assets-mixed-revenue"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -22454,7 +26551,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-18.final-pivot.v29-provenance-gated-debt-capex"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-19.final-pivot.v36-mixed-revenue-geography"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -23252,6 +27349,7 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
         )
 
     final_pivot = _apply_quality_result_fixes(final_pivot)
+    final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
     final_pivot = _normalize_output_margin_rows(final_pivot)
     final_pivot = _hide_stale_operating_measure_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
@@ -23981,6 +28079,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             # able to overwrite it before the CSV is written.
             final_pivot = _reconcile_segment_partition_from_total(final_pivot)
             final_pivot = _apply_quality_result_fixes(final_pivot)
+            final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
 
             # --- Clean up sparse/abandoned rows via calculation linkbase mathematically ---
             label_to_concept = {}
@@ -24080,6 +28179,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                     final_pivot.at[_period_header_key, _period] = _display_date
 
         final_pivot = _apply_quality_result_fixes(final_pivot)
+        final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
         final_pivot = _normalize_output_margin_rows(final_pivot)
         final_pivot = _hide_stale_operating_measure_rows(final_pivot)
         final_pivot = _hide_unsupported_trailing_periods(
