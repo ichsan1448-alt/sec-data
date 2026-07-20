@@ -7805,45 +7805,162 @@ def _gb_columnar_metric_spec(label: str, table_corpus: str):
     return None
 
 
-def _extract_columnar_segment_breakdown_from_table(
-        table: pd.DataFrame, context: str, current_year: int,
-        preferred_duration: int = 90, reference_magnitude=None):
-    """Extract tables whose rows are metrics and columns are segment members.
 
-    This layout is common after the 2024 ASC 280 significant-expense adoption.
-    It is deliberately bounded to tables with at least two segment columns and
-    at least two explicit financial metric rows.
+def _gb_columnar_segment_period_blocks(
+        table: pd.DataFrame, current_year: int):
+    """Return explicit period blocks from a metric-rows × member-columns table.
+
+    SEC inline-XBRL renderings often place several comparative periods inside
+    one HTML table as repeated blocks:
+
+        Three Months Ended ... 2024
+        [Mobility | Delivery | Freight | Total]
+        Revenue ...
+        Segment Adjusted EBITDA ...
+        Three Months Ended ... 2025
+        [Mobility | Delivery | Freight | Total]
+        Revenue ...
+        Segment Adjusted EBITDA ...
+
+    The legacy parser promoted the first member-header row and then treated
+    every metric row in every block as ``current_year``.  Candidate arbitration
+    consequently selected the first (comparative) block for the current period.
+
+    This helper separates repeated blocks and preserves each block's explicit
+    period heading.  It returns ``(grid, value_header, ordinal_base)`` tuples.
     """
-    df = _gb_prepare_columnar_segment_grid(table)
-    if df.empty or len(df.columns) < 3:
+    if table is None or table.empty:
         return []
+
+    raw = table.copy().dropna(how='all', axis=0).dropna(how='all', axis=1)
+    if raw.empty or len(raw.columns) < 3:
+        return []
+    raw.columns = [_gb_flatten_column(column) for column in raw.columns]
+
+    header_rows = []
+    for row_pos in range(len(raw)):
+        row = list(raw.iloc[row_pos])
+        numeric = sum(
+            _gb_parse_number(value)[0] is not None
+            for value in row
+        )
+        headers = [_gb_clean_text(value) for value in row]
+        members = {
+            _gb_columnar_member_from_header(value)
+            for value in headers
+            if _gb_columnar_member_from_header(value)
+        }
+        if numeric == 0 and len(members) >= 2:
+            header_rows.append(row_pos)
+
+    # One member header is the ordinary single-period geometry handled by the
+    # existing grid normalizer.  The special path is only for repeated blocks.
+    if len(header_rows) < 2:
+        return []
+
+    def _period_heading_before(header_pos: int, previous_header: int | None):
+        lower_bound = 0 if previous_header is None else previous_header + 1
+        best = ''
+        for row_pos in range(header_pos - 1, lower_bound - 1, -1):
+            text = _gb_clean_text(' | '.join(
+                _gb_clean_text(value)
+                for value in raw.iloc[row_pos].tolist()
+                if _gb_clean_text(value)
+            ))
+            if not text:
+                continue
+            has_year = bool(re.search(r'\b20\d{2}\b', text))
+            has_period = bool(re.search(
+                r'\b(?:three|six|nine|twelve)\s+months?\s+ended\b|'
+                r'\byear\s+ended\b|\bfiscal\s+year\b',
+                text, flags=re.I))
+            has_date = any(pattern.search(text)
+                           for pattern in _GB_HEADER_DATE_PATTERNS)
+            if has_year and (has_period or has_date):
+                return text
+            if has_year and not best:
+                best = text
+        return best or str(current_year)
+
+    blocks = []
+    previous_header = None
+    for block_number, header_pos in enumerate(header_rows):
+        next_header = (
+            header_rows[block_number + 1]
+            if block_number + 1 < len(header_rows)
+            else len(raw)
+        )
+        header_values = [
+            _gb_clean_text(value)
+            for value in raw.iloc[header_pos].tolist()
+        ]
+        columns = []
+        for col_pos, value in enumerate(header_values):
+            if value:
+                columns.append(value)
+            elif col_pos == 0:
+                columns.append('Metric')
+            else:
+                columns.append(f'column_{col_pos}')
+
+        block = raw.iloc[header_pos + 1:next_header].copy()
+        block.columns = columns
+        block = block.dropna(how='all', axis=0).dropna(how='all', axis=1)
+        if block.empty:
+            previous_header = header_pos
+            continue
+
+        value_header = _period_heading_before(
+            header_pos, previous_header)
+        blocks.append((
+            block,
+            value_header,
+            int(header_pos * 10_000),
+        ))
+        previous_header = header_pos
+
+    return blocks
+
+
+def _gb_extract_columnar_segment_candidates_from_grid(
+        df: pd.DataFrame, context: str, current_year: int,
+        preferred_duration: int = 90, reference_magnitude=None,
+        value_header: str | None = None, ordinal_base: int = 0):
+    """Extract one already-isolated columnar segment period block."""
+    if df is None or df.empty or len(df.columns) < 3:
+        return []
+
     label_position = 0
-    # Prefer the column containing the strongest concentration of metric labels.
     best = (-1, 0)
-    for pos in range(min(3, len(df.columns))):
-        labels = [_gb_row_label(value) for value in df.iloc[:, pos].tolist()]
-        score = sum(bool(_GB_COLUMNAR_SEGMENT_METRIC_RE.fullmatch(label))
-                    or bool(_GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(label))
-                    for label in labels if label)
+    for col_pos in range(min(3, len(df.columns))):
+        labels = [_gb_row_label(value)
+                  for value in df.iloc[:, col_pos].tolist()]
+        score = sum(
+            bool(_GB_COLUMNAR_SEGMENT_METRIC_RE.fullmatch(label))
+            or bool(_GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(label))
+            for label in labels if label)
         if score > best[0]:
-            best = (score, pos)
+            best = (score, col_pos)
     label_position = best[1]
     if best[0] < 2:
         return []
 
     member_positions = defaultdict(list)
-    for pos, column in enumerate(df.columns):
-        if pos == label_position:
+    for col_pos, column in enumerate(df.columns):
+        if col_pos == label_position:
             continue
         member = _gb_columnar_member_from_header(column)
         if member:
-            member_positions[_normalize_label_key(member)].append((pos, member))
+            member_positions[
+                _normalize_label_key(member)
+            ].append((col_pos, member))
     if len(member_positions) < 2:
         return []
 
-    corpus = _gb_table_role_corpus(table, df, context)
+    corpus = _gb_table_role_corpus(df, df, context)
     specs = []
-    for ordinal, row in enumerate(df.itertuples(index=False, name=None)):
+    for ordinal, row in enumerate(
+            df.itertuples(index=False, name=None)):
         if label_position >= len(row):
             continue
         raw_label = _gb_clean_text(row[label_position])
@@ -7853,7 +7970,7 @@ def _extract_columnar_segment_breakdown_from_table(
     if len(specs) < 2:
         return []
 
-    table_scale = _gb_detect_scale(context, table)
+    table_scale = _gb_detect_scale(context, df)
     if table_scale is None:
         return []
     if float(table_scale) == 1.0 and reference_magnitude:
@@ -7865,44 +7982,84 @@ def _extract_columnar_segment_breakdown_from_table(
                 if value is not None:
                     displayed.append(abs(float(value)))
         if displayed and max(displayed) < 1_000_000:
-            # Same conservative magnitude arbitration as ordinary financial
-            # tables when a detached caption omits "in millions".
             raw_max = max(displayed)
             ref = abs(float(reference_magnitude))
             plausible = []
             for scale in (1.0, 1_000.0, 1_000_000.0):
                 ratio = raw_max * scale / max(ref, 1.0)
                 if 0.001 <= ratio <= 1.5:
-                    plausible.append((abs(math.log10(ratio) - math.log10(0.10)), scale))
+                    plausible.append((
+                        abs(math.log10(ratio) - math.log10(0.10)),
+                        scale,
+                    ))
             if plausible:
                 table_scale = min(plausible)[1]
 
+    explicit_header = _gb_clean_text(value_header) or str(current_year)
+    duration = _gb_duration_from_header(
+        explicit_header, int(preferred_duration))
+    header_years = [
+        int(year) for year in re.findall(r'\b(20\d{2})\b', explicit_header)
+    ]
+    period_role = (
+        'current'
+        if int(current_year) in header_years
+        else ('comparative' if header_years else None)
+    )
+
     candidates = []
-    duration = int(preferred_duration)
     for ordinal, row, raw_label, (prefix, detail) in specs:
         for positions in member_positions.values():
             member = positions[0][1]
             value, raw_value = _gb_coalesced_period_value(
                 row, [position for position, _ in positions])
+            contextual_dash_zero = False
             if value is None:
-                continue
+                raw_cells = [
+                    _gb_clean_text(row[position])
+                    for position, _ in positions
+                    if position < len(row)
+                    and _gb_clean_text(row[position])
+                ]
+                normalized_dash_cells = {
+                    re.sub(r'[\s$€£¥()]', '', cell)
+                    for cell in raw_cells
+                }
+                dash_tokens = {'-', '–', '—', '−'}
+                if (
+                    prefix == 'Adjusted Segment EBITDA'
+                    and raw_cells
+                    and normalized_dash_cells
+                    and normalized_dash_cells.issubset(dash_tokens)
+                ):
+                    # Admit as a provisional zero only.  The family-closure
+                    # filter below must prove the zero from either the member
+                    # P&L identity or the complete segment-to-total
+                    # reconciliation before it can survive publication.
+                    value = 0.0
+                    raw_value = raw_cells[0]
+                    contextual_dash_zero = True
+                else:
+                    continue
             if detail:
                 display_label = f'{prefix} - {member} - {detail}'
-                metric_identity = _normalize_label_key(f'{prefix} {detail}')
+                metric_identity = _normalize_label_key(
+                    f'{prefix} {detail}')
             else:
                 display_label = f'{prefix} - {member}'
                 metric_identity = _normalize_label_key(prefix)
-            period_basis = (_GB_BASIS_INSTANT_END if prefix == 'Assets'
-                            else _GB_BASIS_DURATION_FLOW)
+            period_basis = (
+                _GB_BASIS_INSTANT_END
+                if prefix == 'Assets'
+                else _GB_BASIS_DURATION_FLOW)
             scaled = float(value) * float(table_scale)
-            # Parentheses in segment-reconciliation tables show deductions.
-            # The published expense rows use positive expense magnitudes, while
-            # profit/loss measures retain their filed sign.
-            if prefix in {'Significant Segment Expenses',
-                          'Depreciation & Amortization'}:
+            if prefix in {
+                    'Significant Segment Expenses',
+                    'Depreciation & Amortization'}:
                 scaled = abs(scaled)
             nearest = round(scaled)
-            if abs(scaled - nearest) <= max(1e-6, abs(scaled) * 1e-12):
+            if abs(scaled - nearest) <= max(
+                    1e-6, abs(scaled) * 1e-12):
                 scaled = float(nearest)
             candidates.append({
                 'SourceLabel': raw_label,
@@ -7919,24 +8076,247 @@ def _extract_columnar_segment_breakdown_from_table(
                 'Confidence': 0.995,
                 'PeriodBasis': period_basis,
                 'BasisConfidence': 0.995,
-                'TableRole': (_GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE
-                              if prefix == 'Adjusted Segment EBITDA'
-                              else (_GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
-                                    if prefix == 'Significant Segment Expenses'
-                                    else _GB_ROLE_REPORTABLE_SEGMENT_PNL)),
+                'TableRole': (
+                    _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE
+                    if prefix == 'Adjusted Segment EBITDA'
+                    else (
+                        _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                        if prefix == 'Significant Segment Expenses'
+                        else _GB_ROLE_REPORTABLE_SEGMENT_PNL)),
                 'TableGeometry': 'metric_rows_segment_columns',
                 'AnalyticalBasis': 'reportable_segment_pnl',
                 'Category': '4a_Segments_Business',
                 'SemanticType': prefix,
-                'AdmissionRule': 'columnar_segment_table',
+                'AdmissionRule': (
+                    'columnar_segment_table_contextual_dash_zero'
+                    if contextual_dash_zero
+                    else 'columnar_segment_table'),
+                'ContextualDashZero': bool(contextual_dash_zero),
                 'MetricFamily': None,
                 'MetricIdentity': metric_identity,
-                'Duration': 0 if period_basis == _GB_BASIS_INSTANT_END else duration,
-                'ValueHeader': str(current_year),
-                'SourceRowOrdinal': int(ordinal * 100 + positions[0][0]),
+                'Duration': (
+                    0 if period_basis == _GB_BASIS_INSTANT_END
+                    else duration),
+                'ValueHeader': explicit_header,
+                'PeriodRole': period_role,
+                'SourceRowOrdinal': int(
+                    ordinal_base + ordinal * 100 + positions[0][0]),
             })
-    # A real reportable table must yield at least two metrics across two members.
     return candidates if len(candidates) >= 4 else []
+
+
+
+def _gb_filter_columnar_segment_family_closure(candidates):
+    """Reject a mixed columnar segment block that fails its filed identity.
+
+    When Revenue, direct transaction costs, Other, and Segment Adjusted EBITDA
+    are all present for at least two members in one explicit period block, each
+    member must satisfy:
+
+        Revenue - direct transaction costs - Other
+            = Segment Adjusted EBITDA
+
+    Tables that expose only the performance measure (without its components)
+    are left unchanged.  A failed complete block is rejected as a family rather
+    than selecting individually plausible cells.
+    """
+    if not candidates:
+        return candidates
+
+    grouped = defaultdict(list)
+    for candidate in candidates:
+        grouped[_gb_clean_text(
+            candidate.get('ValueHeader'))].append(candidate)
+
+    kept = []
+    rejected = []
+    for value_header, rows in grouped.items():
+        members = defaultdict(dict)
+        for candidate in rows:
+            label = str(candidate.get('Label') or '')
+            value = pd.to_numeric(
+                pd.Series([candidate.get('Value')]),
+                errors='coerce').iloc[0]
+            if pd.isna(value):
+                continue
+            if label.startswith('Revenue - '):
+                member = label[len('Revenue - '):]
+                if ' - ' not in member:
+                    members[member]['revenue'] = float(value)
+            elif label.startswith('Adjusted Segment EBITDA - '):
+                member = label[len('Adjusted Segment EBITDA - '):]
+                if ' - ' not in member:
+                    members[member]['ebitda'] = float(value)
+            elif label.startswith(
+                    'Significant Segment Expenses - '):
+                remainder = label[
+                    len('Significant Segment Expenses - '):]
+                parts = remainder.split(' - ', 1)
+                if len(parts) != 2:
+                    continue
+                member, detail = parts
+                detail_key = _normalize_label_key(detail)
+                if 'platform participant direct transaction cost' in detail_key:
+                    members[member]['direct'] = abs(float(value))
+                elif detail_key == 'other':
+                    members[member]['other'] = abs(float(value))
+
+        complete = {
+            member: values for member, values in members.items()
+            if {'revenue', 'direct', 'other', 'ebitda'}.issubset(values)
+        }
+        failed = []
+        if len(complete) >= 2:
+            for member, values in complete.items():
+                implied = (
+                    values['revenue']
+                    - values['direct']
+                    - values['other'])
+                scale = max(
+                    abs(implied), abs(values['ebitda']),
+                    abs(values['revenue']), 1.0)
+                if abs(implied - values['ebitda']) > max(
+                        2_000_000.0, 0.0015 * scale):
+                    failed.append(member)
+
+        if failed:
+            rejected.append(
+                f"{value_header or 'unknown period'} "
+                f"({', '.join(sorted(failed))})")
+            continue
+
+        dash_rows = [
+            candidate for candidate in rows
+            if bool(candidate.get('ContextualDashZero'))
+        ]
+        if dash_rows:
+            ebitda_values = {}
+            for candidate in rows:
+                label = str(candidate.get('Label') or '')
+                if not label.startswith('Adjusted Segment EBITDA - '):
+                    continue
+                member = label[len('Adjusted Segment EBITDA - '):]
+                if ' - ' in member:
+                    continue
+                value = pd.to_numeric(
+                    pd.Series([candidate.get('Value')]),
+                    errors='coerce').iloc[0]
+                if pd.notna(value):
+                    ebitda_values[member] = float(value)
+
+            def _member_role(member):
+                key = _normalize_label_key(member)
+                if (
+                    key in {'total', 'consolidated', 'adjusted ebitda'}
+                    or key.startswith('total ')
+                ):
+                    return 'total'
+                if any(token in key for token in (
+                        'corporate', 'unallocated', 'central',
+                        'platform r d', 'platform research development')):
+                    return 'reconciliation'
+                return 'segment'
+
+            totals = [
+                value for member, value in ebitda_values.items()
+                if _member_role(member) == 'total'
+            ]
+            reconciliations = [
+                value for member, value in ebitda_values.items()
+                if _member_role(member) == 'reconciliation'
+            ]
+            reportable = [
+                value for member, value in ebitda_values.items()
+                if _member_role(member) == 'segment'
+            ]
+            total_closes = False
+            if len(totals) == 1 and len(reportable) >= 2:
+                implied_total = sum(reportable) + sum(reconciliations)
+                scale = max(abs(implied_total), abs(totals[0]), 1.0)
+                total_closes = abs(implied_total - totals[0]) <= max(
+                    2_000_000.0, 0.0015 * scale)
+
+            invalid_dash_ids = set()
+            for candidate in dash_rows:
+                label = str(candidate.get('Label') or '')
+                member = label[len('Adjusted Segment EBITDA - '):]
+                component_proven = False
+                values = complete.get(member)
+                if values is not None:
+                    implied = (
+                        values['revenue']
+                        - values['direct']
+                        - values['other'])
+                    scale = max(
+                        abs(implied), abs(values['ebitda']),
+                        abs(values['revenue']), 1.0)
+                    component_proven = abs(
+                        implied - values['ebitda']) <= max(
+                            2_000_000.0, 0.0015 * scale)
+                if not component_proven and not total_closes:
+                    invalid_dash_ids.add(id(candidate))
+
+            if invalid_dash_ids:
+                rows = [
+                    candidate for candidate in rows
+                    if id(candidate) not in invalid_dash_ids
+                ]
+                rejected.append(
+                    f"{value_header or 'unknown period'} "
+                    "(unproven dash-as-zero candidate)")
+
+        kept.extend(rows)
+
+    if rejected:
+        print(
+            "  [Segment Table Closure] Rejected mixed period block(s): "
+            + '; '.join(rejected)
+        )
+    return kept
+
+
+def _extract_columnar_segment_breakdown_from_table(
+        table: pd.DataFrame, context: str, current_year: int,
+        preferred_duration: int = 90, reference_magnitude=None):
+    """Extract metric-rows × segment-columns tables without period drift.
+
+    Repeated comparative/current blocks are parsed separately and retain their
+    own explicit period headings.  Single-period tables continue through the
+    legacy normalized-grid path.
+    """
+    explicit_blocks = _gb_columnar_segment_period_blocks(
+        table, current_year)
+    if explicit_blocks:
+        candidates = []
+        for grid, value_header, ordinal_base in explicit_blocks:
+            candidates.extend(
+                _gb_extract_columnar_segment_candidates_from_grid(
+                    grid,
+                    context,
+                    current_year,
+                    preferred_duration=preferred_duration,
+                    reference_magnitude=reference_magnitude,
+                    value_header=value_header,
+                    ordinal_base=ordinal_base,
+                )
+            )
+        return _gb_filter_columnar_segment_family_closure(candidates)
+
+    df = _gb_prepare_columnar_segment_grid(table)
+    if df.empty:
+        return []
+    return _gb_filter_columnar_segment_family_closure(
+        _gb_extract_columnar_segment_candidates_from_grid(
+            df,
+            context,
+            current_year,
+            preferred_duration=preferred_duration,
+            reference_magnitude=reference_magnitude,
+            value_header=str(current_year),
+            ordinal_base=0,
+        )
+    )
+
 
 def _extract_generic_business_breakdown_from_table(
         table: pd.DataFrame, context: str, current_year: int,
@@ -8573,7 +8953,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'SourceAnalyticalBasis': candidate.get('AnalyticalBasis'),
                 'SourceDirectness': 'reported',
                 'SourceClassificationConfidence': candidate.get('Confidence'),
-                'SourcePeriodRole': source_period_role,
+                'SourcePeriodRole': (candidate.get('PeriodRole') or source_period_role),
                 'SourceTableFingerprint': source_table_fingerprint,
                 'SourceRowOrdinal': candidate.get('SourceRowOrdinal'),
                 'SourceCellIdentity': _source_cell_identity,
@@ -16756,6 +17136,434 @@ def _gb_materialize_proven_segment_revenue_q4_facts(df: pd.DataFrame) -> pd.Data
     return result
 
 
+
+def _gb_restore_direct_discrete_q4_facts(
+        final_df: pd.DataFrame,
+        direct_q4_rows: pd.DataFrame) -> pd.DataFrame:
+    """Restore an exact directly reported Q4 over an annual-derived Q4.
+
+    This is a late provenance override, not a new global sort order.  It only
+    considers rows whose selected Q4 is derived and candidates that were
+    directly reported as discrete-quarter facts after all label reconciliation.
+
+    Exact category, label and fiscal year must match.  Unit, dimension and
+    metric identities must not conflict.  When several direct candidates exist,
+    the smallest reported unit scale (highest precision) wins, followed by the
+    latest filing.  Materially conflicting candidates at the winning precision
+    fail closed.
+    """
+    required_final = {
+        'Category', 'Label', 'Period', 'Value', 'FY', 'Q'}
+    required_direct = {
+        'Category', 'Label', 'Value', 'FY', 'Q', 'Duration'}
+    if (
+        final_df is None or final_df.empty
+        or direct_q4_rows is None or direct_q4_rows.empty
+        or not required_final.issubset(final_df.columns)
+        or not required_direct.issubset(direct_q4_rows.columns)
+    ):
+        return final_df
+
+    out = final_df.copy()
+    direct = direct_q4_rows.copy()
+    direct['_GBFY'] = pd.to_numeric(direct['FY'], errors='coerce')
+    direct['_GBDuration'] = pd.to_numeric(
+        direct['Duration'], errors='coerce')
+    direct['_GBValue'] = pd.to_numeric(
+        direct['Value'], errors='coerce')
+    direct['_GBFiled'] = pd.to_datetime(
+        direct.get('_Filed_dt', direct.get('Filed')),
+        errors='coerce')
+    direct = direct[
+        direct['Q'].astype(str).eq('Q4')
+        & direct['_GBFY'].notna()
+        & direct['_GBDuration'].between(45, 125)
+        & direct['_GBValue'].notna()
+    ].copy()
+    if direct.empty:
+        return out
+    direct['_GBFY'] = direct['_GBFY'].astype(int)
+
+    def _text(value):
+        if value is None:
+            return ''
+        try:
+            if pd.isna(value):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        return str(value).strip()
+
+    def _number(value, default=np.nan):
+        parsed = pd.to_numeric(
+            pd.Series([value]), errors='coerce').iloc[0]
+        return float(parsed) if pd.notna(parsed) else default
+
+    def _is_derived(row):
+        derivation = _text(row.get('SourceDerivation')).casefold()
+        role = _text(row.get('SourcePeriodRole')).casefold()
+        kind = _text(row.get('SourceKind')).casefold()
+        directness = _text(row.get('SourceDirectness')).casefold()
+        reported = _number(row.get('SourceReportedValue'))
+        is_calculated = bool(row.get('IsCalculated', False))
+        return bool(
+            'annual_minus' in derivation
+            or 'same_basis_quarterization' in derivation
+            or role == 'derived_discrete'
+            or kind.startswith('derived')
+            or directness == 'calculated'
+            or is_calculated
+        )
+
+    def _compatible(selected, candidate):
+        for field in (
+                'SourceUnitKind', 'Unit',
+                'SourceMetricIdentity', 'SourceSemanticType'):
+            left = _text(selected.get(field)).casefold()
+            right = _text(candidate.get(field)).casefold()
+            if left and right and left != right:
+                return False
+
+        for field in (
+                'SourceAxisSignature', 'SourceMemberSignature',
+                'SourceDimensionAxes', 'SourceDimensionMembers'):
+            left = _text(selected.get(field)).casefold()
+            right = _text(candidate.get(field)).casefold()
+            if left and right and left != right:
+                return False
+
+        left_dim = _number(selected.get('DimCount'))
+        right_dim = _number(candidate.get('DimCount'))
+        if (
+            pd.notna(left_dim) and pd.notna(right_dim)
+            and int(left_dim) != int(right_dim)
+        ):
+            return False
+        return True
+
+    def _precision_scale(row):
+        for field in ('SourceUnitScale', 'Scale', 'UnitScale'):
+            value = _number(row.get(field))
+            if pd.notna(value) and value > 0:
+                return float(value)
+        raw = _text(row.get('SourceRawValue') or row.get('RawValue'))
+        if raw:
+            digits = re.sub(r'[^0-9]', '', raw)
+            if digits:
+                return 1.0
+        return float('inf')
+
+    repaired = []
+    for row_index, selected in out.iterrows():
+        if str(selected.get('Q')) != 'Q4':
+            continue
+        if str(selected.get('Label') or '') == 'Other Income / (Expense)':
+            # This aggregate can contain separately published disclosure
+            # components.  Its authoritative Q4 is resolved by the dedicated
+            # non-operating face-line hierarchy gate below.
+            continue
+        if not _is_derived(selected):
+            continue
+        fiscal_year = _number(selected.get('FY'))
+        if pd.isna(fiscal_year):
+            match = re.fullmatch(
+                r'(\d{4})-Q4', _text(selected.get('Period')))
+            if not match:
+                continue
+            fiscal_year = int(match.group(1))
+        fiscal_year = int(fiscal_year)
+
+        candidates = direct[
+            direct['Category'].eq(selected.get('Category'))
+            & direct['Label'].eq(selected.get('Label'))
+            & direct['_GBFY'].eq(fiscal_year)
+        ].copy()
+        if candidates.empty:
+            continue
+        candidates = candidates[
+            candidates.apply(
+                lambda row: _compatible(selected, row), axis=1)]
+        if candidates.empty:
+            continue
+
+        candidates['_GBPrecisionScale'] = candidates.apply(
+            _precision_scale, axis=1)
+        best_scale = candidates['_GBPrecisionScale'].min()
+        best = candidates[
+            candidates['_GBPrecisionScale'].eq(best_scale)
+        ].copy()
+
+        # At the same precision, prefer the latest direct filing.  If the
+        # latest filing still contains materially different values, fail closed.
+        latest_filed = best['_GBFiled'].max()
+        if pd.notna(latest_filed):
+            best = best[best['_GBFiled'].eq(latest_filed)]
+        values = sorted(set(float(value)
+                            for value in best['_GBValue']))
+        if len(values) > 1:
+            reference = max(max(abs(value) for value in values), 1.0)
+            if max(values) - min(values) > max(
+                    2_000_000.0, 0.0015 * reference):
+                continue
+
+        candidate = best.sort_values(
+            ['TagRank'] if 'TagRank' in best.columns else ['_GBValue'],
+            ascending=True,
+        ).iloc[0]
+        old_value = _number(selected.get('Value'))
+        new_value = float(candidate['_GBValue'])
+        if (
+            pd.notna(old_value)
+            and abs(float(old_value) - new_value)
+            <= max(1.0, 1e-12 * max(abs(float(old_value)), abs(new_value), 1.0))
+        ):
+            # Identical direct/derived values do not need a provenance rewrite;
+            # preserving the derived marker also allows later presentation-
+            # context integrity gates to inspect the selected basis.
+            continue
+
+        period = selected.get('Period')
+        replacement = candidate.copy()
+        for column in out.columns:
+            if column in replacement.index:
+                out.at[row_index, column] = replacement[column]
+        out.at[row_index, 'Period'] = period
+        out.at[row_index, 'Value'] = new_value
+        if 'SourceDerivation' in out.columns:
+            out.at[row_index, 'SourceDerivation'] = np.nan
+        if 'SourcePeriodRole' in out.columns:
+            out.at[row_index, 'SourcePeriodRole'] = (
+                replacement.get('SourcePeriodRole') or 'direct_discrete')
+        if 'SourceDirectness' in out.columns:
+            out.at[row_index, 'SourceDirectness'] = 'reported'
+        if 'IsCalculated' in out.columns:
+            out.at[row_index, 'IsCalculated'] = False
+        if 'SourceAdmissionRule' in out.columns:
+            existing_rule = _text(
+                replacement.get('SourceAdmissionRule'))
+            out.at[row_index, 'SourceAdmissionRule'] = (
+                existing_rule or 'direct_discrete_q4_precedence')
+        repaired.append(
+            f"{selected.get('Label')} FY{fiscal_year}: "
+            f"{old_value:,.0f} -> {new_value:,.0f}"
+        )
+
+    if repaired:
+        print(
+            "  [Direct Q4 Precedence] Restored directly reported "
+            + '; '.join(repaired)
+        )
+    return out
+
+
+def _gb_repair_authoritative_nonoperating_face_line(
+        final_pivot: pd.DataFrame,
+        fact_audit: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Fold duplicated non-operating details into the authoritative face line.
+
+    A filing may present Interest Income, Interest Expense and one aggregate
+    ``Other income (expense), net`` line on the statement face, while separate
+    disclosures expose investment gains or similar components of that aggregate.
+    If those details are published as additive peers, the accounting engine
+    creates ``Pretax Income: Other Adjustments`` to cancel the double count.
+
+    For a derived Q4 aggregate only, reconstruct the authoritative face line
+    directly from reported Pretax and Operating Income:
+
+        Other face line =
+            Pretax - Operating - Interest Income + Interest Expense
+            - separately reported equity-method income
+
+    Investment-gain and other disclosure components remain visible, but the
+    artificial pretax bridge is set to zero.  Directly reported aggregate
+    ``Other Income / (Expense)`` facts are protected.
+    """
+    if (
+        final_pivot is None or final_pivot.empty
+        or not isinstance(final_pivot.index, pd.MultiIndex)
+    ):
+        return final_pivot
+
+    required = {
+        'operating': ('1_Income_Statement', 'Operating Income'),
+        'pretax': ('1_Income_Statement', 'Pretax Income'),
+        'other': ('1_Income_Statement', 'Other Income / (Expense)'),
+        'adjustment': (
+            '1_Income_Statement', 'Pretax Income: Other Adjustments'),
+    }
+    if any(idx not in final_pivot.index for idx in required.values()):
+        return final_pivot
+
+    optional = {
+        'interest_income': ('1_Income_Statement', 'Interest Income'),
+        'interest_expense': ('1_Income_Statement', 'Interest Expense'),
+        'equity_method': ('1_Income_Statement', 'Equity Method Income'),
+        'gain_loss': ('1_Income_Statement', 'Gain/Loss on Investments'),
+    }
+
+    def _num(value):
+        return pd.to_numeric(
+            pd.Series([value]), errors='coerce').iloc[0]
+
+    def _close(left, right):
+        left = _num(left); right = _num(right)
+        if pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        return abs(float(left) - float(right)) <= max(
+            2_000_000.0, 0.0015 * scale)
+
+    derived_periods = set()
+    if (
+        isinstance(fact_audit, pd.DataFrame)
+        and not fact_audit.empty
+        and {'Category', 'Label', 'Period'}.issubset(fact_audit.columns)
+    ):
+        rows = fact_audit[
+            fact_audit['Category'].eq('1_Income_Statement')
+            & fact_audit['Label'].eq('Other Income / (Expense)')
+        ]
+        for _, row in rows.iterrows():
+            derivation = str(row.get('SourceDerivation') or '').casefold()
+            role = str(row.get('SourcePeriodRole') or '').casefold()
+            reported = _num(row.get('SourceReportedValue'))
+            if (
+                'annual_minus' in derivation
+                or 'same_basis_quarterization' in derivation
+                or role == 'derived_discrete'
+                or pd.isna(reported)
+            ):
+                derived_periods.add(str(row.get('Period')))
+
+    out = final_pivot.copy()
+    attrs = dict(getattr(final_pivot, 'attrs', {}) or {})
+    repaired = []
+
+    for column in out.columns:
+        period = str(column)
+        if not re.fullmatch(r'\d{4}-Q4', period):
+            continue
+        if derived_periods and period not in derived_periods:
+            continue
+
+        operating = _num(out.at[required['operating'], column])
+        pretax = _num(out.at[required['pretax'], column])
+        current_other = _num(out.at[required['other'], column])
+        adjustment = _num(out.at[required['adjustment'], column])
+        if any(pd.isna(value) for value in (
+                operating, pretax, current_other, adjustment)):
+            continue
+        if abs(float(adjustment)) < 1_000_000.0:
+            continue
+
+        interest_income = (
+            _num(out.at[optional['interest_income'], column])
+            if optional['interest_income'] in out.index else 0.0)
+        interest_expense = (
+            _num(out.at[optional['interest_expense'], column])
+            if optional['interest_expense'] in out.index else 0.0)
+        equity_method = (
+            _num(out.at[optional['equity_method'], column])
+            if optional['equity_method'] in out.index else 0.0)
+        gain_loss = (
+            _num(out.at[optional['gain_loss'], column])
+            if optional['gain_loss'] in out.index else 0.0)
+        interest_income = 0.0 if pd.isna(interest_income) else float(interest_income)
+        interest_expense = 0.0 if pd.isna(interest_expense) else float(interest_expense)
+        equity_method = 0.0 if pd.isna(equity_method) else float(equity_method)
+        gain_loss = 0.0 if pd.isna(gain_loss) else float(gain_loss)
+
+        authoritative_other = (
+            float(pretax) - float(operating)
+            - interest_income + interest_expense
+            - equity_method
+        )
+
+        # This repair is specifically for an aggregate face line that has one
+        # separately published investment-gain detail incorrectly treated as an
+        # additive peer.  A material face-line correction must be present.
+        if abs(gain_loss) < 1_000_000.0:
+            continue
+        if abs(authoritative_other - float(current_other)) < 1_000_000.0:
+            continue
+
+        # The existing bridge must be exactly explainable by the duplicated
+        # investment detail plus the difference between selected and
+        # authoritative aggregate.  A genuine duplicate-component case also
+        # has a distinctive shape: the bridge substantially offsets the detail
+        # with the opposite sign, while the aggregate face-line correction is
+        # small relative to that duplicated component.  This rejects ordinary
+        # residual bridges where investment gains are merely one of several
+        # unrelated non-operating items.
+        explained_adjustment = (
+            authoritative_other - float(current_other) - gain_loss
+        )
+        if not _close(explained_adjustment, adjustment):
+            continue
+        correction = authoritative_other - float(current_other)
+        if float(adjustment) * float(gain_loss) >= 0:
+            continue
+        offset_ratio = abs(float(adjustment)) / max(abs(gain_loss), 1.0)
+        if not 0.50 <= offset_ratio <= 1.50:
+            continue
+        if abs(correction) > max(2_000_000.0, 0.25 * abs(gain_loss)):
+            continue
+
+        if abs(authoritative_other) > max(
+                2_000_000_000.0,
+                0.50 * max(abs(float(pretax)), abs(float(operating)), 1.0)):
+            continue
+
+        out.at[required['other'], column] = authoritative_other
+        out.at[required['adjustment'], column] = 0.0
+
+        # Preserve the investment detail as a disclosure child rather than an
+        # additive income-statement peer of the aggregate face line.
+        gain_idx = optional['gain_loss']
+        disclosure_idx = (
+            '6_Disclosures',
+            'Gain/Loss on Investments - Included in Other Income / (Expense)',
+        )
+        if disclosure_idx not in out.index:
+            out.loc[disclosure_idx, :] = np.nan
+        out.at[disclosure_idx, column] = gain_loss
+        if gain_idx in out.index:
+            out.at[gain_idx, column] = np.nan
+
+        repaired.append(
+            f"{period}: Other Income {float(current_other):,.0f} -> "
+            f"{authoritative_other:,.0f}; bridge {float(adjustment):,.0f} -> 0"
+        )
+
+        if (
+            isinstance(fact_audit, pd.DataFrame)
+            and not fact_audit.empty
+            and {'Category', 'Label', 'Period', 'Value'}.issubset(
+                fact_audit.columns)
+        ):
+            other_mask = (
+                fact_audit['Category'].eq(required['other'][0])
+                & fact_audit['Label'].eq(required['other'][1])
+                & fact_audit['Period'].astype(str).eq(period)
+            )
+            fact_audit.loc[other_mask, 'Value'] = authoritative_other
+            if 'SourceDerivation' in fact_audit.columns:
+                fact_audit.loc[other_mask, 'SourceDerivation'] = (
+                    'authoritative_nonoperating_face_identity')
+            if 'SourceAdmissionRule' in fact_audit.columns:
+                fact_audit.loc[other_mask, 'SourceAdmissionRule'] = (
+                    'pretax_operating_interest_face_reconciliation')
+
+    if repaired:
+        print(
+            "  [Non-operating Face Line] Repaired authoritative aggregate: "
+            + '; '.join(repaired)
+        )
+    out.attrs.update(attrs)
+    return out
+
+
+
 def build_pivoted_data(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     with _ProfileTimer("build_pivoted_data_total"):
         return _build_pivoted_data_impl(
@@ -16812,6 +17620,37 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
     df = _gb_prefer_instant_segment_asset_candidates(df)
     df = _gb_prefer_complete_instant_asset_table_candidates(df)
+
+    # Retain direct discrete-Q4 candidates after every label/semantic
+    # reconciliation pass but before latest-filed dedup.  This narrow ledger is
+    # used only to stop an annual-minus-YTD reconstruction from overwriting an
+    # exact reported quarter.
+    _direct_q4_duration = pd.to_numeric(
+        df.get('Duration', pd.Series(np.nan, index=df.index)),
+        errors='coerce')
+    _direct_q4_derivation = df.get(
+        'SourceDerivation', pd.Series('', index=df.index)
+    ).fillna('').astype(str).str.strip()
+    _direct_q4_calculated = df.get(
+        'IsCalculated', pd.Series(False, index=df.index)
+    ).fillna(False).astype(bool)
+    _direct_q4_directness = df.get(
+        'SourceDirectness', pd.Series('', index=df.index)
+    ).fillna('').astype(str).str.casefold()
+    _direct_discrete_q4_rows = df[
+        df.get('Q', pd.Series('', index=df.index)).astype(str).eq('Q4')
+        & _direct_q4_duration.between(45, 125)
+        & _direct_q4_derivation.eq('')
+        & ~_direct_q4_calculated
+        & ~_direct_q4_directness.eq('calculated')
+        & df.get('Category', pd.Series('', index=df.index)).isin({
+            '1_Income_Statement',
+            '4a_Segments_Business',
+            '4b_Segments_Geographic_Regions',
+            '4c_Segments_Geographic_Countries',
+        })
+    ].copy()
+
     # Keep the audit separately.  A DataFrame stored inside ``DataFrame.attrs``
     # makes pandas concat attempt element-wise DataFrame equality when it
     # reconciles attrs from the operating/non-operating slices, which raises
@@ -18683,6 +19522,10 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             _final_sort, ascending=_final_ascending)
     final_df = pd.concat([_final_non_operating, _final_operating], axis=0)
     final_df = final_df.drop_duplicates(subset=['Category', 'Label', 'Period'], keep='first')
+    final_df = _gb_restore_direct_discrete_q4_facts(
+        final_df,
+        _direct_discrete_q4_rows,
+    )
     final_df = _gb_repair_paired_presentation_reclassification_q4(
         final_df,
         _presentation_reclassification_annual_rows,
@@ -30176,7 +31019,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v56-all-period-hedge-annual-neutral-segment"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v57-direct-q4-period-block-nonoperating-face"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -31828,6 +32671,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_relocate_revenue_hedging_residual(
             final_pivot, _fact_audit)
         final_pivot = _gb_repair_annual_neutral_top_level_segment_revenue(
+            final_pivot, _fact_audit)
+        final_pivot = _gb_repair_authoritative_nonoperating_face_line(
             final_pivot, _fact_audit)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
