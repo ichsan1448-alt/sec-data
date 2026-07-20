@@ -18744,8 +18744,6 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_pivot = final_long.pivot(index=['Category', 'Label'], columns='Period', values='Value')
     import json
     final_pivot = _apply_accounting_engine(final_pivot, is_financial=is_financial, is_insurance=is_insurance, is_oil_gas=is_oil_gas, is_reit=is_reit)
-    final_pivot = _gb_relocate_revenue_hedging_residual(
-        final_pivot, fact_audit)
     final_pivot = _apply_industry_kpis(final_pivot, is_financial=is_financial, is_insurance=is_insurance)
     final_pivot = _recompute_cf_residuals(final_pivot)
     final_pivot = _move_noisy_business_segment_rows_to_disclosures(final_pivot)
@@ -21177,10 +21175,11 @@ def _gb_repair_paired_presentation_reclassification_q4(
     deltas prove that the revision was a presentation reclassification that
     left gross profit unchanged.
 
-    The selected Q1-Q3 values determine the compatible annual cohort:
-    an earlier annual filing must already have been available by the latest
-    selected Q1-Q3 filing date, while the currently used annual cohort must be
-    a later revision.  Direct Q4 facts are never overwritten.
+    The selected Q1-Q3 values determine the compatible annual cohort.
+    Prefer an annual filing already available by the latest selected Q1-Q3
+    filing date.  For older comparative periods, also permit the earliest
+    direct annual filing after Q3 when it unambiguously precedes a later
+    retrospective reclassification.  Direct Q4 facts are never overwritten.
 
     No issuer, ticker, year, concept, or amount is hardcoded.
     """
@@ -21489,14 +21488,46 @@ def _gb_repair_paired_presentation_reclassification_q4(
                 or current['filed'] <= quarter_cutoff):
             continue
 
-        earlier_candidates = [
+        chronological_candidates = [
             cohort for cohort in cohorts
             if pd.notna(cohort['filed'])
-            and cohort['filed'] <= quarter_cutoff
+            and cohort['filed'] < current['filed']
             and cohort['key'] != current['key']
         ]
-        if not earlier_candidates:
+        if not chronological_candidates:
             continue
+
+        # Preferred case: the compatible annual cohort had already been filed
+        # by the latest selected Q1-Q3 comparative fact.
+        earlier_candidates = [
+            cohort for cohort in chronological_candidates
+            if cohort['filed'] <= quarter_cutoff
+        ]
+
+        # Older comparative periods can legitimately follow this chronology:
+        #
+        #   selected Q1-Q3 comparatives
+        #       -> first direct annual filing
+        #       -> later retrospective presentation reclassification
+        #
+        # In that case no annual cohort existed by the Q1-Q3 cutoff.  Admit
+        # only the earliest direct annual filing after the cutoff, and only
+        # cohorts sharing that one filing date.  The paired Revenue / Cost of
+        # Revenue delta and unchanged Gross Profit checks below must still
+        # prove the accounting reclassification.  Any ambiguity fails closed.
+        if not earlier_candidates:
+            post_cutoff = [
+                cohort for cohort in chronological_candidates
+                if cohort['filed'] > quarter_cutoff
+            ]
+            if not post_cutoff:
+                continue
+            earliest_filed = min(
+                cohort['filed'] for cohort in post_cutoff)
+            earlier_candidates = [
+                cohort for cohort in post_cutoff
+                if cohort['filed'] == earliest_filed
+            ]
 
         proven = []
         for candidate in earlier_candidates:
@@ -21674,7 +21705,6 @@ def _gb_relocate_revenue_hedging_residual(
     when all of the following are true:
       * the issuer has recurring disclosure rows explicitly linking hedging to
         revenue or sales;
-      * the consolidated Revenue cell is a derived Q4 annual-minus-YTD value;
       * Revenue, Cost of Revenue, Gross Profit, Operating Income and the bridge
         adjustment are all present;
       * the adjustment is material but small relative to revenue;
@@ -21682,14 +21712,20 @@ def _gb_relocate_revenue_hedging_residual(
       * Gross Profit - operating expenses + the adjustment already ties to
         reported Operating Income when an Operating Expenses row is available.
 
+    A derived Q4 annual-minus-YTD cell can use the recurring disclosure family
+    as evidence because its annual residual may contain the full-year hedge
+    amount.  A non-Q4 cell is admitted only when a unique same-period
+    revenue-hedge disclosure equals the bridge adjustment.  This prevents a
+    supplemental "revenue excluding hedging" fact from being published as
+    consolidated GAAP revenue even when it was directly tagged.
+
     The repair performs an algebraic relocation only:
       Revenue += adjustment
       Gross Profit += adjustment
       Operating Income: Other Adjustments = 0
 
-    Operating Income is therefore unchanged.  Direct Q4 revenue facts, non-Q4
-    periods, segments, EPS, cash flow and all issuers without recurring
-    revenue-hedging evidence are ineligible.
+    Operating Income is therefore unchanged.  Segments, EPS, cash flow and all
+    issuers without recurring revenue-hedging evidence are ineligible.
     """
     if (final_pivot is None or final_pivot.empty
             or fact_audit is None or fact_audit.empty
@@ -21700,18 +21736,65 @@ def _gb_relocate_revenue_hedging_residual(
     if not required_audit.issubset(fact_audit.columns):
         return final_pivot
 
-    # Strong issuer-level evidence: multiple periods of disclosures whose
-    # captions explicitly connect hedging with revenue/sales.
-    labels = fact_audit.get('Label', pd.Series('', index=fact_audit.index)).astype(str)
+    # Strong issuer-level evidence: a recurring disclosure whose caption
+    # explicitly presents revenue hedging gains/losses.  Exclude accumulated
+    # OCI, individual contracts and reclassification mechanics, which can carry
+    # different component amounts under similar words.
+    labels = fact_audit.get(
+        'Label', pd.Series('', index=fact_audit.index)).astype(str)
     categories = fact_audit.get(
         'Category', pd.Series('', index=fact_audit.index)).astype(str)
+    hedge_noise = labels.str.contains(
+        r'accumulated|other comprehensive|cash flow hedg|contract|'
+        r'reclassification|derivative',
+        case=False, na=False, regex=True)
     hedge_revenue_mask = (
         categories.eq('6_Disclosures')
         & labels.str.contains(r'hedg', case=False, na=False, regex=True)
         & labels.str.contains(r'revenue|sales', case=False, na=False, regex=True)
+        & labels.str.contains(r'gain|loss', case=False, na=False, regex=True)
+        & ~hedge_noise
     )
     hedge_evidence = fact_audit.loc[hedge_revenue_mask].copy()
-    if hedge_evidence.empty or hedge_evidence['Period'].astype(str).nunique() < 4:
+
+    pivot_hedge_candidates = []
+    for idx in final_pivot.index:
+        category, label = idx
+        label_text = str(label or '')
+        if category != '6_Disclosures':
+            continue
+        if not re.search(r'hedg', label_text, flags=re.I):
+            continue
+        if not re.search(r'revenue|sales', label_text, flags=re.I):
+            continue
+        if not re.search(r'gain|loss', label_text, flags=re.I):
+            continue
+        if re.search(
+                r'accumulated|other comprehensive|cash flow hedg|contract|'
+                r'reclassification|derivative',
+                label_text, flags=re.I):
+            continue
+        coverage = pd.to_numeric(
+            final_pivot.loc[idx], errors='coerce').notna().sum()
+        if coverage >= 4:
+            pivot_hedge_candidates.append((int(coverage), idx))
+
+    pivot_hedge_idx = None
+    if pivot_hedge_candidates:
+        best_coverage = max(item[0] for item in pivot_hedge_candidates)
+        best = [
+            idx for coverage, idx in pivot_hedge_candidates
+            if coverage == best_coverage
+        ]
+        if len(best) == 1:
+            pivot_hedge_idx = best[0]
+
+    audit_periods = (
+        hedge_evidence['Period'].astype(str).nunique()
+        if not hedge_evidence.empty and 'Period' in hedge_evidence.columns
+        else 0
+    )
+    if pivot_hedge_idx is None and audit_periods < 4:
         return final_pivot
 
     revenue_idx = ('1_Income_Statement', 'Revenue')
@@ -21748,9 +21831,36 @@ def _gb_relocate_revenue_hedging_residual(
     if revenue_audit.empty:
         return final_pivot
 
+    def _same_period_hedge_value(period):
+        if (
+            pivot_hedge_idx is not None
+            and str(period) in final_pivot.columns
+        ):
+            value = _num(final_pivot.at[pivot_hedge_idx, str(period)])
+            if pd.notna(value):
+                return float(value)
+
+        if hedge_evidence.empty or 'Value' not in hedge_evidence.columns:
+            return None
+        rows = hedge_evidence[
+            hedge_evidence['Period'].astype(str).eq(str(period))
+        ].copy()
+        if rows.empty:
+            return None
+        values = pd.to_numeric(rows['Value'], errors='coerce').dropna()
+        if values.empty:
+            return None
+        unique = []
+        for value in values.astype(float):
+            if not any(_close(value, existing) for existing in unique):
+                unique.append(float(value))
+        if len(unique) != 1:
+            return None
+        return unique[0]
+
     for column in out.columns:
         period = str(column)
-        if not re.fullmatch(r'\d{4}-Q4', period):
+        if not re.fullmatch(r'\d{4}-Q[1-4]', period):
             continue
         selected = revenue_audit[revenue_audit['Period'].astype(str).eq(period)]
         if len(selected) != 1:
@@ -21758,15 +21868,15 @@ def _gb_relocate_revenue_hedging_residual(
         selected = selected.iloc[0]
         derivation = str(selected.get('SourceDerivation') or '').casefold()
         period_role = str(selected.get('SourcePeriodRole') or '').casefold()
-        if not (
-            'annual_minus_ytd' in derivation
-            or 'annual_minus_q1_q2_q3' in derivation
-            or period_role == 'derived_discrete'
-        ):
-            continue
-        # Direct/reported Q4 cells are never touched.
-        if pd.notna(_num(selected.get('SourceReportedValue'))):
-            continue
+        is_derived_q4 = bool(
+            period.endswith('-Q4')
+            and (
+                'annual_minus_ytd' in derivation
+                or 'annual_minus_q1_q2_q3' in derivation
+                or period_role == 'derived_discrete'
+            )
+        )
+        same_period_hedge = _same_period_hedge_value(period)
 
         revenue = _num(out.at[revenue_idx, column])
         cost = _num(out.at[cost_idx, column])
@@ -21780,6 +21890,17 @@ def _gb_relocate_revenue_hedging_residual(
             continue
         if abs(float(adjustment)) > max(500_000_000.0, 0.02 * abs(float(revenue))):
             continue
+
+        # Historical Q4 annual-minus-YTD derivations can absorb a full-year
+        # hedge residual, so recurring issuer-level evidence is sufficient.
+        # Every other quarter requires the exact same-period disclosure value.
+        if not is_derived_q4:
+            if (
+                same_period_hedge is None
+                or not _close(float(adjustment), same_period_hedge)
+            ):
+                continue
+
         if not _close(float(revenue) - float(cost), gross):
             continue
 
@@ -21801,9 +21922,39 @@ def _gb_relocate_revenue_hedging_residual(
         # equal the consolidated accounting residual one-for-one.
 
         corrected_revenue = float(revenue) + float(adjustment)
+        corrected_gross_profit = float(gross) + float(adjustment)
         out.at[revenue_idx, column] = corrected_revenue
-        out.at[gross_idx, column] = float(gross) + float(adjustment)
+        out.at[gross_idx, column] = corrected_gross_profit
         out.at[adjustment_idx, column] = 0.0
+
+        # This function now runs at the absolute consolidated-output boundary,
+        # after every segment reconciliation/publication pass.  Refresh only
+        # existing revenue-denominated KPI rows for the corrected period.
+        # No segment, geographic, operating-metric, balance-sheet or cash-flow
+        # row is eligible.
+        ratio_specs = (
+            (('5_KPI_Metrics', 'Gross Margin (%)'),
+             gross_idx, 2),
+            (('5_KPI_Metrics', 'Operating Margin (%)'),
+             op_income_idx, 2),
+            (('5_KPI_Metrics', 'Net Margin (%)'),
+             ('1_Income_Statement', 'Net Income'), 2),
+            (('5_KPI_Metrics', 'Metric: EBITDA Margin %'),
+             ('5_KPI_Metrics', 'Metric: EBITDA'), None),
+            (('5_KPI_Metrics', 'FCF Margin (%)'),
+             ('5_KPI_Metrics', 'Metric: Free Cash Flow'), None),
+        )
+        if abs(corrected_revenue) > 1e-9:
+            for ratio_idx, numerator_idx, decimals in ratio_specs:
+                if ratio_idx not in out.index or numerator_idx not in out.index:
+                    continue
+                numerator = _num(out.at[numerator_idx, column])
+                if pd.isna(numerator):
+                    continue
+                ratio_value = 100.0 * float(numerator) / corrected_revenue
+                if decimals is not None:
+                    ratio_value = round(ratio_value, decimals)
+                out.at[ratio_idx, column] = ratio_value
 
         # Keep the exported fact audit aligned with the corrected public CSV.
         audit_index = selected.name
@@ -21833,8 +21984,356 @@ def _gb_relocate_revenue_hedging_residual(
 
     if repaired:
         print(
-            "  [Revenue Hedging Residual] Relocated proven Q4 residual(s): "
+            "  [Revenue Hedging Residual] Relocated proven period residual(s): "
             + '; '.join(repaired))
+    out.attrs.update(attrs)
+    return out
+
+
+
+def _gb_repair_annual_neutral_top_level_segment_revenue(
+        final_pivot: pd.DataFrame,
+        fact_audit: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Repair a dominant top-level segment whose quarterly basis is mixed.
+
+    Some filers introduce a new segment presentation retrospectively.  The
+    annual top-level segment total may be correct, while comparative Q1-Q3
+    rows still include a separately disclosed revenue hedge and the derived
+    Q4 absorbs the offset.  Every individual quarter is then wrong even though
+    the four-quarter sum remains correct.
+
+    This output-boundary gate changes one segment row only when all evidence is
+    present:
+      * consolidated Revenue, at least three top-level business-segment revenue
+        rows, and one recurring revenue-hedge disclosure are available;
+      * exactly one segment is dominant (normally at least 70% of revenue and
+        three times the next-largest segment);
+      * the segment table has at least eight other periods that already satisfy
+        Revenue = segment revenues + revenue hedging;
+      * all four quarters of one fiscal year are complete;
+      * at least three quarterly residuals are material, but their annual sum
+        is zero within filing-rounding tolerance;
+      * at least two of Q1-Q3 residuals are the inverse of the disclosed hedge;
+      * each replacement is positive, plausible, and no direct target-segment
+        fact exists in the selected-fact audit.
+
+    The repair redistributes an already-correct annual segment total across its
+    quarters.  Consolidated Revenue, all other segments, geography, operating
+    income, EPS, cash flow and balance-sheet rows are never changed.
+    """
+    if (
+        final_pivot is None
+        or final_pivot.empty
+        or not isinstance(final_pivot.index, pd.MultiIndex)
+    ):
+        return final_pivot
+
+    revenue_idx = ('1_Income_Statement', 'Revenue')
+    if revenue_idx not in final_pivot.index:
+        return final_pivot
+
+    period_columns = sorted(
+        [
+            column for column in final_pivot.columns
+            if re.fullmatch(r'\d{4}-Q[1-4]', str(column))
+        ],
+        key=lambda column: (
+            int(str(column)[:4]), int(str(column)[-1])),
+    )
+    if len(period_columns) < 12:
+        return final_pivot
+
+    def _num(value):
+        return pd.to_numeric(
+            pd.Series([value]), errors='coerce').iloc[0]
+
+    def _text(value):
+        if value is None:
+            return ''
+        try:
+            if pd.isna(value):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        return str(value).strip()
+
+    def _close(left, right, *, floor=2_000_000.0, ratio=0.0015):
+        left = _num(left)
+        right = _num(right)
+        if pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        return abs(float(left) - float(right)) <= max(
+            floor, ratio * scale)
+
+    top_level_rows = []
+    for idx in final_pivot.index:
+        category, label = idx
+        label_text = str(label or '')
+        if category != '4a_Segments_Business':
+            continue
+        if not label_text.startswith('Revenue - '):
+            continue
+        # Top-level members contain one separator after the Revenue prefix.
+        # Nested product/member rows contain two or more.
+        if label_text.count(' - ') != 1:
+            continue
+        values = pd.to_numeric(
+            final_pivot.loc[idx, period_columns], errors='coerce')
+        if values.notna().sum() < 8:
+            continue
+        if (values.dropna() < -2_000_000.0).any():
+            continue
+        top_level_rows.append(idx)
+
+    if len(top_level_rows) < 3 or len(top_level_rows) > 10:
+        return final_pivot
+
+    hedge_rows = []
+    for idx in final_pivot.index:
+        category, label = idx
+        label_text = str(label or '')
+        if category != '6_Disclosures':
+            continue
+        if not re.search(r'hedg', label_text, flags=re.I):
+            continue
+        if not re.search(r'revenue|sales', label_text, flags=re.I):
+            continue
+        if not re.search(r'gain|loss', label_text, flags=re.I):
+            continue
+        if re.search(
+                r'accumulated|other comprehensive|cash flow hedg|contract|'
+                r'reclassification|derivative|excluding hedg|exclude hedg',
+                label_text, flags=re.I):
+            continue
+        coverage = pd.to_numeric(
+            final_pivot.loc[idx, period_columns],
+            errors='coerce').notna().sum()
+        if coverage >= 8:
+            hedge_rows.append((int(coverage), idx))
+
+    if not hedge_rows:
+        return final_pivot
+    max_coverage = max(item[0] for item in hedge_rows)
+    best_hedge_rows = [
+        idx for coverage, idx in hedge_rows if coverage == max_coverage
+    ]
+    if len(best_hedge_rows) != 1:
+        return final_pivot
+    hedge_idx = best_hedge_rows[0]
+
+    # Find one dominant segment across a broad history.  This prevents the gate
+    # from redistributing revenue in a balanced multi-segment company.
+    dominance_counts = {idx: 0 for idx in top_level_rows}
+    complete_periods = []
+    for column in period_columns:
+        total = _num(final_pivot.at[revenue_idx, column])
+        hedge = _num(final_pivot.at[hedge_idx, column])
+        values = {
+            idx: _num(final_pivot.at[idx, column])
+            for idx in top_level_rows
+        }
+        if (
+            pd.isna(total)
+            or pd.isna(hedge)
+            or any(pd.isna(value) for value in values.values())
+            or float(total) <= 0
+        ):
+            continue
+        complete_periods.append(column)
+        ordered = sorted(
+            ((float(value), idx) for idx, value in values.items()),
+            reverse=True,
+        )
+        largest_value, largest_idx = ordered[0]
+        next_value = ordered[1][0]
+        if (
+            largest_value >= 0.70 * float(total)
+            and largest_value >= 3.0 * max(next_value, 1.0)
+        ):
+            dominance_counts[largest_idx] += 1
+
+    if len(complete_periods) < 12:
+        return final_pivot
+    dominant_candidates = [
+        idx for idx, count in dominance_counts.items()
+        if count >= max(8, int(0.70 * len(complete_periods)))
+    ]
+    if len(dominant_candidates) != 1:
+        return final_pivot
+    target_idx = dominant_candidates[0]
+
+    # The table structure must already close in many other periods.
+    closed_periods = 0
+    for column in complete_periods:
+        total = float(_num(final_pivot.at[revenue_idx, column]))
+        hedge = float(_num(final_pivot.at[hedge_idx, column]))
+        segment_sum = sum(
+            float(_num(final_pivot.at[idx, column]))
+            for idx in top_level_rows
+        )
+        if _close(total, segment_sum + hedge):
+            closed_periods += 1
+    if closed_periods < 8:
+        return final_pivot
+
+    # Selected direct segment facts are protected.  A missing audit row means
+    # the target was created by a later segment derivation/reconciliation pass.
+    direct_periods = set()
+    if (
+        isinstance(fact_audit, pd.DataFrame)
+        and not fact_audit.empty
+        and {'Category', 'Label', 'Period'}.issubset(fact_audit.columns)
+    ):
+        selected = fact_audit[
+            fact_audit['Category'].eq(target_idx[0])
+            & fact_audit['Label'].eq(target_idx[1])
+        ].copy()
+        for _, row in selected.iterrows():
+            derivation = _text(row.get('SourceDerivation'))
+            source_kind = _text(row.get('SourceKind')).casefold()
+            directness = _text(row.get('SourceDirectness')).casefold()
+            reported_value = _num(row.get('SourceReportedValue'))
+            is_direct = bool(
+                pd.notna(reported_value)
+                or (
+                    not derivation
+                    and not source_kind.startswith('derived')
+                    and directness != 'calculated'
+                )
+            )
+            if is_direct:
+                direct_periods.add(str(row.get('Period')))
+
+    out = final_pivot.copy()
+    attrs = dict(getattr(final_pivot, 'attrs', {}) or {})
+    repairs = []
+
+    fiscal_years = sorted({
+        int(str(column)[:4]) for column in complete_periods
+    })
+    for fiscal_year in fiscal_years:
+        columns = [f'{fiscal_year}-Q{quarter}' for quarter in range(1, 5)]
+        if any(column not in complete_periods for column in columns):
+            continue
+        if any(column in direct_periods for column in columns):
+            continue
+
+        corrections = {}
+        replacements = {}
+        hedges = {}
+        valid = True
+        for column in columns:
+            total = _num(out.at[revenue_idx, column])
+            hedge = _num(out.at[hedge_idx, column])
+            target = _num(out.at[target_idx, column])
+            other_sum = 0.0
+            for idx in top_level_rows:
+                if idx == target_idx:
+                    continue
+                value = _num(out.at[idx, column])
+                if pd.isna(value):
+                    valid = False
+                    break
+                other_sum += float(value)
+            if (
+                not valid
+                or pd.isna(total)
+                or pd.isna(hedge)
+                or pd.isna(target)
+            ):
+                valid = False
+                break
+
+            replacement = float(total) - float(hedge) - other_sum
+            correction = replacement - float(target)
+            if replacement < -2_000_000.0:
+                valid = False
+                break
+            if abs(correction) > max(
+                    500_000_000.0, 0.03 * max(abs(float(target)), 1.0)):
+                valid = False
+                break
+            corrections[column] = correction
+            replacements[column] = replacement
+            hedges[column] = float(hedge)
+
+        if not valid:
+            continue
+
+        material = [
+            column for column, correction in corrections.items()
+            if abs(correction) > 2_000_000.0
+        ]
+        if len(material) < 3:
+            continue
+
+        annual_scale = max(
+            sum(abs(float(_num(out.at[target_idx, column])))
+                for column in columns),
+            1.0,
+        )
+        if abs(sum(corrections.values())) > max(
+                2_000_000.0, 0.0015 * annual_scale):
+            continue
+
+        hedge_matches = sum(
+            1 for column in columns[:3]
+            if _close(corrections[column], -hedges[column])
+        )
+        if hedge_matches < 2:
+            continue
+
+        if not _close(
+                corrections[columns[3]],
+                -sum(corrections[column] for column in columns[:3]),
+        ):
+            continue
+
+        for column in columns:
+            out.at[target_idx, column] = float(replacements[column])
+
+        repairs.append(
+            f"FY{fiscal_year} {target_idx[1]}: "
+            + ', '.join(
+                f"{column} {corrections[column]:+,.0f}"
+                for column in columns
+            )
+        )
+
+        if (
+            isinstance(fact_audit, pd.DataFrame)
+            and not fact_audit.empty
+            and {'Category', 'Label', 'Period', 'Value'}.issubset(
+                fact_audit.columns)
+        ):
+            for column in columns:
+                mask = (
+                    fact_audit['Category'].eq(target_idx[0])
+                    & fact_audit['Label'].eq(target_idx[1])
+                    & fact_audit['Period'].astype(str).eq(column)
+                )
+                if not mask.any():
+                    continue
+                fact_audit.loc[mask, 'Value'] = replacements[column]
+                if 'SourceDerivation' in fact_audit.columns:
+                    fact_audit.loc[mask, 'SourceDerivation'] = (
+                        'annual_neutral_top_level_segment_'
+                        'revenue_redistribution')
+                if 'SourceAdmissionRule' in fact_audit.columns:
+                    fact_audit.loc[mask, 'SourceAdmissionRule'] = (
+                        'annual_neutral_segment_bridge_with_revenue_hedge')
+                if 'SourceDerivationFormula' in fact_audit.columns:
+                    fact_audit.loc[mask, 'SourceDerivationFormula'] = (
+                        f"consolidated Revenue - revenue hedge - "
+                        f"other top-level segments = {replacements[column]}"
+                    )
+
+    if repairs:
+        print(
+            "  [Segment Annual-Neutral Bridge] "
+            + '; '.join(repairs)
+        )
     out.attrs.update(attrs)
     return out
 
@@ -24469,6 +24968,370 @@ def apply_stock_splits(df):
                 if pd.notna(v): df.at[idx, col] = float(v) / factor
     if shares_adj or eps_adj: print("  [Stock Split] Adjusted to current split basis.")
     return df
+
+
+def _gb_normalize_large_coherent_stock_split_basis(
+        df: pd.DataFrame,
+        fact_audit: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Normalize a large, internally coherent EPS/share basis discontinuity.
+
+    ``apply_stock_splits`` intentionally refuses to alter an older era when
+    Net Income / Shares / EPS already reconciles on that era's filed basis.
+    That protects genuine IPOs and recapitalizations, but it can leave a mixed
+    time series when later filings retroactively restate only part of history
+    for a large stock split.
+
+    This second gate is deliberately narrower:
+      * Basic and diluted weighted-average shares must both jump at the same
+        adjacent-quarter boundary by the same known factor.
+      * The factor must be at least 15x.
+      * At least three quarters on each side must form clean, stable and
+        chronologically separated share-level eras.
+      * Basic and diluted Net Income / Shares / EPS identities must reconcile
+        independently on both sides.
+      * No material equity/IPO cash issuance may occur around the boundary.
+      * Total assets and equity may not show a recapitalization-scale jump.
+      * Exactly one qualifying boundary may exist.
+
+    Only EPS and weighted-average-share rows are changed.  Revenue, expenses,
+    net income, balance sheet, cash flow, segments and operating metrics are
+    never touched.  No issuer, ticker or year is hardcoded; the gate uses a
+    conservative large-factor floor and a standard split-factor set.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+
+    shares_basic = (
+        '1_Income_Statement', 'Shares Outstanding Basic')
+    shares_diluted = (
+        '1_Income_Statement', 'Shares Outstanding Diluted')
+    eps_basic = ('1_Income_Statement', 'EPS Basic')
+    eps_diluted = ('1_Income_Statement', 'EPS Diluted')
+    net_income = ('1_Income_Statement', 'Net Income')
+    required = (
+        shares_basic, shares_diluted, eps_basic, eps_diluted, net_income)
+    if any(idx not in df.index for idx in required):
+        return df
+
+    period_columns = sorted(
+        [
+            column for column in df.columns
+            if re.fullmatch(r'\d{4}-Q[1-4]', str(column))
+        ],
+        key=lambda column: (
+            int(str(column)[:4]), int(str(column)[-1])),
+    )
+    if len(period_columns) < 8:
+        return df
+
+    numeric = {
+        idx: pd.to_numeric(df.loc[idx, period_columns], errors='coerce')
+        for idx in required
+    }
+    known_factors = (
+        15.0, 20.0, 25.0, 28.0, 30.0, 40.0, 50.0, 75.0, 100.0)
+    minimum_shares = 1_000_000.0
+
+    def _nearest_factor(ratio):
+        factor = min(
+            known_factors, key=lambda candidate: abs(candidate - ratio))
+        error = abs(float(ratio) - factor) / factor
+        return factor, error
+
+    def _identity_is_coherent(columns, shares_idx, eps_idx):
+        values = []
+        for column in columns:
+            income = numeric[net_income].get(column, np.nan)
+            shares = numeric[shares_idx].get(column, np.nan)
+            eps = numeric[eps_idx].get(column, np.nan)
+            if (
+                pd.isna(income) or pd.isna(shares) or pd.isna(eps)
+                or abs(float(income)) < 1_000_000.0
+                or float(shares) < minimum_shares
+                or abs(float(eps)) < 1e-6
+            ):
+                continue
+            ratio = abs(
+                float(income) / (float(shares) * float(eps)))
+            if np.isfinite(ratio):
+                values.append(ratio)
+        if len(values) < 2:
+            return False
+        values = np.asarray(values, dtype=float)
+        return bool(
+            np.median(np.abs(values - 1.0)) <= 0.15
+            and np.mean((values >= 0.70) & (values <= 1.30)) >= 0.75
+        )
+
+    def _material_equity_issuance_near(columns):
+        revenue_idx = ('1_Income_Statement', 'Revenue')
+        if revenue_idx in df.index:
+            revenue_values = pd.to_numeric(
+                df.loc[revenue_idx, columns], errors='coerce')
+            revenue_reference = float(
+                np.nanmedian(np.abs(revenue_values.to_numpy(dtype=float))))
+        else:
+            revenue_reference = 0.0
+        materiality = max(50_000_000.0, 0.05 * revenue_reference)
+
+        for category, label in df.index:
+            if category != '3_Cash_Flow':
+                continue
+            text = str(label or '').casefold()
+            if (
+                'debt' in text
+                or 'stock plan' in text
+                or 'share-based' in text
+                or 'repurch' in text
+                or 'dividend' in text
+            ):
+                continue
+            equity_terms = any(
+                token in text
+                for token in (
+                    'common stock', 'ordinary share', 'equity',
+                    'shares issued', 'stock issuance',
+                    'initial public offering', ' ipo',
+                )
+            )
+            event_terms = any(
+                token in text
+                for token in (
+                    'proceeds', 'issuance', 'issued',
+                    'offering', 'initial public offering', ' ipo',
+                )
+            )
+            if not (equity_terms and event_terms):
+                continue
+            values = pd.to_numeric(
+                df.loc[(category, label), columns],
+                errors='coerce').fillna(0.0)
+            positive = values.clip(lower=0.0)
+            if not positive.empty and float(positive.max()) > materiality:
+                return True
+        return False
+
+    def _balance_sheet_recapitalization(boundary_index):
+        check_pairs = (
+            (('2_Balance_Sheet', 'Total Assets'), 3.0),
+            (('2_Balance_Sheet', 'Total Equity'), 3.0),
+        )
+        left_column = period_columns[boundary_index - 1]
+        right_column = period_columns[boundary_index]
+        for row_idx, limit in check_pairs:
+            if row_idx not in df.index:
+                continue
+            left = pd.to_numeric(
+                pd.Series([df.at[row_idx, left_column]]),
+                errors='coerce').iloc[0]
+            right = pd.to_numeric(
+                pd.Series([df.at[row_idx, right_column]]),
+                errors='coerce').iloc[0]
+            if (
+                pd.isna(left) or pd.isna(right)
+                or abs(float(left)) < 1.0 or abs(float(right)) < 1.0
+            ):
+                continue
+            ratio = max(
+                abs(float(left) / float(right)),
+                abs(float(right) / float(left)),
+            )
+            if ratio > limit:
+                return True
+        return False
+
+    candidates = []
+    for boundary in range(1, len(period_columns)):
+        left_column = period_columns[boundary - 1]
+        right_column = period_columns[boundary]
+        factor_signals = []
+
+        for shares_idx in (shares_basic, shares_diluted):
+            left = numeric[shares_idx].get(left_column, np.nan)
+            right = numeric[shares_idx].get(right_column, np.nan)
+            if (
+                pd.isna(left) or pd.isna(right)
+                or min(abs(float(left)), abs(float(right))) < minimum_shares
+            ):
+                factor_signals = []
+                break
+            raw_ratio = abs(float(right) / float(left))
+            direction = 1 if raw_ratio >= 1.0 else -1
+            ratio = raw_ratio if raw_ratio >= 1.0 else 1.0 / raw_ratio
+            factor, error = _nearest_factor(ratio)
+            if factor < 15.0 or error > 0.08:
+                factor_signals = []
+                break
+            factor_signals.append((factor, direction))
+
+        if len(factor_signals) != 2:
+            continue
+        if factor_signals[0] != factor_signals[1]:
+            continue
+        factor, direction = factor_signals[0]
+
+        older_window = period_columns[max(0, boundary - 6):boundary]
+        newer_window = period_columns[
+            boundary:min(len(period_columns), boundary + 6)]
+        if len(older_window) < 3 or len(newer_window) < 3:
+            continue
+
+        medians = {}
+        stable = True
+        for shares_idx in (shares_basic, shares_diluted):
+            older = numeric[shares_idx][older_window].dropna()
+            newer = numeric[shares_idx][newer_window].dropna()
+            if len(older) < 3 or len(newer) < 3:
+                stable = False
+                break
+            older_median = float(older.median())
+            newer_median = float(newer.median())
+            expected_ratio = factor if direction == 1 else 1.0 / factor
+            actual_ratio = newer_median / older_median
+            if abs(actual_ratio - expected_ratio) / abs(
+                    expected_ratio) > 0.10:
+                stable = False
+                break
+            if (
+                (older / older_median).between(0.70, 1.30).mean() < 0.80
+                or (newer / newer_median).between(
+                    0.70, 1.30).mean() < 0.80
+            ):
+                stable = False
+                break
+            medians[shares_idx] = (older_median, newer_median)
+        if not stable:
+            continue
+
+        # The two bases must form chronologically clean eras, rather than the
+        # alternating annual/discrete spikes seen in malformed share series.
+        era_is_clean = True
+        for shares_idx in (shares_basic, shares_diluted):
+            older_median, newer_median = medians[shares_idx]
+            threshold = float(np.sqrt(older_median * newer_median))
+            older_values = numeric[shares_idx][
+                period_columns[:boundary]].dropna()
+            newer_values = numeric[shares_idx][
+                period_columns[boundary:]].dropna()
+            if direction == 1:
+                older_share = (older_values < threshold).mean()
+                newer_share = (newer_values > threshold).mean()
+            else:
+                older_share = (older_values > threshold).mean()
+                newer_share = (newer_values < threshold).mean()
+            if older_share < 0.90 or newer_share < 0.90:
+                era_is_clean = False
+                break
+        if not era_is_clean:
+            continue
+
+        if not all((
+            _identity_is_coherent(
+                older_window, shares_basic, eps_basic),
+            _identity_is_coherent(
+                newer_window, shares_basic, eps_basic),
+            _identity_is_coherent(
+                older_window, shares_diluted, eps_diluted),
+            _identity_is_coherent(
+                newer_window, shares_diluted, eps_diluted),
+        )):
+            continue
+
+        event_columns = period_columns[
+            max(0, boundary - 1):min(
+                len(period_columns), boundary + 2)]
+        if _material_equity_issuance_near(event_columns):
+            continue
+        if _balance_sheet_recapitalization(boundary):
+            continue
+
+        candidates.append({
+            'boundary': boundary,
+            'factor': float(factor),
+            'direction': int(direction),
+            'left': left_column,
+            'right': right_column,
+        })
+
+    if len(candidates) != 1:
+        return df
+
+    candidate = candidates[0]
+    boundary = candidate['boundary']
+    factor = candidate['factor']
+    direction = candidate['direction']
+    adjusted_columns = period_columns[:boundary]
+
+    out = df.copy()
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    share_multiplier = factor if direction == 1 else 1.0 / factor
+    eps_multiplier = 1.0 / factor if direction == 1 else factor
+
+    for column in adjusted_columns:
+        for row_idx in (shares_basic, shares_diluted):
+            value = pd.to_numeric(
+                pd.Series([out.at[row_idx, column]]),
+                errors='coerce').iloc[0]
+            if pd.notna(value):
+                out.at[row_idx, column] = (
+                    float(value) * share_multiplier)
+        for row_idx in (eps_basic, eps_diluted):
+            value = pd.to_numeric(
+                pd.Series([out.at[row_idx, column]]),
+                errors='coerce').iloc[0]
+            if pd.notna(value):
+                out.at[row_idx, column] = (
+                    float(value) * eps_multiplier)
+
+    if (
+        isinstance(fact_audit, pd.DataFrame)
+        and not fact_audit.empty
+        and {'Category', 'Label', 'Period', 'Value'}.issubset(
+            fact_audit.columns)
+    ):
+        for label, multiplier in (
+            ('Shares Outstanding Basic', share_multiplier),
+            ('Shares Outstanding Diluted', share_multiplier),
+            ('EPS Basic', eps_multiplier),
+            ('EPS Diluted', eps_multiplier),
+        ):
+            mask = (
+                fact_audit['Category'].eq('1_Income_Statement')
+                & fact_audit['Label'].eq(label)
+                & fact_audit['Period'].astype(str).isin(adjusted_columns)
+            )
+            if not mask.any():
+                continue
+            original_values = pd.to_numeric(
+                fact_audit.loc[mask, 'Value'], errors='coerce')
+            fact_audit.loc[mask, 'Value'] = (
+                original_values * multiplier)
+            if 'SourceDerivation' in fact_audit.columns:
+                fact_audit.loc[mask, 'SourceDerivation'] = (
+                    'large_coherent_stock_split_basis_normalization')
+            if 'SourceAdmissionRule' in fact_audit.columns:
+                fact_audit.loc[mask, 'SourceAdmissionRule'] = (
+                    'dual_share_dual_eps_large_split_basis')
+            if 'SourceDerivationFormula' in fact_audit.columns:
+                fact_audit.loc[mask, 'SourceDerivationFormula'] = (
+                    fact_audit.loc[mask, 'Value'].map(
+                        lambda value: (
+                            f"normalized by split factor {factor:g}; "
+                            f"result {value}"
+                        )
+                    )
+                )
+
+    nice_factor = (
+        int(factor) if float(factor).is_integer() else factor)
+    print(
+        "  [Stock Split Basis] Normalized coherent historical "
+        f"{nice_factor}:1 basis through {candidate['left']} "
+        f"(new basis begins {candidate['right']})."
+    )
+    out.attrs.update(attrs)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Institutional Cleanup Engine (post-pivot)
@@ -29313,7 +30176,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v54-revenue-hedging-residual"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v56-all-period-hedge-annual-neutral-segment"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -30821,6 +31684,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
 
             final_pivot = _sort_preserving_values(final_pivot, sort_key, is_item_order, is_financial, is_insurance, context="native quarterly final sort")
             final_pivot = apply_stock_splits(final_pivot)
+            final_pivot = _gb_normalize_large_coherent_stock_split_basis(
+                final_pivot, _fact_audit)
             final_pivot = _institutional_cleanup(final_pivot)
             final_pivot = _reconcile_equity_with_nci(final_pivot)
             final_pivot = _neutralize_ytd_undercapture(final_pivot)
@@ -30960,6 +31825,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
         final_pivot = _gb_route_proven_geographic_metric_families(
             final_pivot)
+        final_pivot = _gb_relocate_revenue_hedging_residual(
+            final_pivot, _fact_audit)
+        final_pivot = _gb_repair_annual_neutral_top_level_segment_revenue(
+            final_pivot, _fact_audit)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
