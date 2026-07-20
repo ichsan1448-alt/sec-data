@@ -18744,6 +18744,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_pivot = final_long.pivot(index=['Category', 'Label'], columns='Period', values='Value')
     import json
     final_pivot = _apply_accounting_engine(final_pivot, is_financial=is_financial, is_insurance=is_insurance, is_oil_gas=is_oil_gas, is_reit=is_reit)
+    final_pivot = _gb_relocate_revenue_hedging_residual(
+        final_pivot, fact_audit)
     final_pivot = _apply_industry_kpis(final_pivot, is_financial=is_financial, is_insurance=is_insurance)
     final_pivot = _recompute_cf_residuals(final_pivot)
     final_pivot = _move_noisy_business_segment_rows_to_disclosures(final_pivot)
@@ -21652,6 +21654,188 @@ def _gb_repair_paired_presentation_reclassification_q4(
         print(
             "  [Presentation Reclassification Q4] "
             + "; ".join(repaired))
+    return out
+
+
+
+def _gb_relocate_revenue_hedging_residual(
+        final_pivot: pd.DataFrame,
+        fact_audit: pd.DataFrame) -> pd.DataFrame:
+    """Move a proven revenue-hedging residual into Revenue/Gross Profit.
+
+    Some filers tag the consolidated revenue fact with the standard revenue
+    concept while presenting a supplemental "revenue excluding hedging" value
+    under the same concept/context family.  When that value wins the annual-
+    minus-YTD Q4 derivation, the accounting engine preserves reported operating
+    income by placing the exact omitted amount in ``Operating Income: Other
+    Adjustments``.
+
+    This output-boundary repair is deliberately fail-closed.  It activates only
+    when all of the following are true:
+      * the issuer has recurring disclosure rows explicitly linking hedging to
+        revenue or sales;
+      * the consolidated Revenue cell is a derived Q4 annual-minus-YTD value;
+      * Revenue, Cost of Revenue, Gross Profit, Operating Income and the bridge
+        adjustment are all present;
+      * the adjustment is material but small relative to revenue;
+      * Revenue - Cost of Revenue equals the existing Gross Profit; and
+      * Gross Profit - operating expenses + the adjustment already ties to
+        reported Operating Income when an Operating Expenses row is available.
+
+    The repair performs an algebraic relocation only:
+      Revenue += adjustment
+      Gross Profit += adjustment
+      Operating Income: Other Adjustments = 0
+
+    Operating Income is therefore unchanged.  Direct Q4 revenue facts, non-Q4
+    periods, segments, EPS, cash flow and all issuers without recurring
+    revenue-hedging evidence are ineligible.
+    """
+    if (final_pivot is None or final_pivot.empty
+            or fact_audit is None or fact_audit.empty
+            or not isinstance(final_pivot.index, pd.MultiIndex)):
+        return final_pivot
+
+    required_audit = {'Category', 'Label', 'Period', 'SourceDerivation'}
+    if not required_audit.issubset(fact_audit.columns):
+        return final_pivot
+
+    # Strong issuer-level evidence: multiple periods of disclosures whose
+    # captions explicitly connect hedging with revenue/sales.
+    labels = fact_audit.get('Label', pd.Series('', index=fact_audit.index)).astype(str)
+    categories = fact_audit.get(
+        'Category', pd.Series('', index=fact_audit.index)).astype(str)
+    hedge_revenue_mask = (
+        categories.eq('6_Disclosures')
+        & labels.str.contains(r'hedg', case=False, na=False, regex=True)
+        & labels.str.contains(r'revenue|sales', case=False, na=False, regex=True)
+    )
+    hedge_evidence = fact_audit.loc[hedge_revenue_mask].copy()
+    if hedge_evidence.empty or hedge_evidence['Period'].astype(str).nunique() < 4:
+        return final_pivot
+
+    revenue_idx = ('1_Income_Statement', 'Revenue')
+    cost_idx = ('1_Income_Statement', 'Cost of Revenue')
+    gross_idx = ('1_Income_Statement', 'Gross Profit')
+    op_income_idx = ('1_Income_Statement', 'Operating Income')
+    adjustment_idx = (
+        '1_Income_Statement', 'Operating Income: Other Adjustments')
+    op_expense_idx = ('1_Income_Statement', 'Operating Expenses')
+
+    required_rows = [
+        revenue_idx, cost_idx, gross_idx, op_income_idx, adjustment_idx]
+    if any(idx not in final_pivot.index for idx in required_rows):
+        return final_pivot
+
+    out = final_pivot.copy()
+    attrs = dict(getattr(final_pivot, 'attrs', {}) or {})
+    repaired = []
+
+    def _num(value):
+        return pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+
+    def _close(left, right):
+        left = _num(left); right = _num(right)
+        if pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        return abs(float(left) - float(right)) <= max(2_000_000.0, 0.0015 * scale)
+
+    revenue_audit = fact_audit[
+        fact_audit['Category'].eq('1_Income_Statement')
+        & fact_audit['Label'].eq('Revenue')
+    ].copy()
+    if revenue_audit.empty:
+        return final_pivot
+
+    for column in out.columns:
+        period = str(column)
+        if not re.fullmatch(r'\d{4}-Q4', period):
+            continue
+        selected = revenue_audit[revenue_audit['Period'].astype(str).eq(period)]
+        if len(selected) != 1:
+            continue
+        selected = selected.iloc[0]
+        derivation = str(selected.get('SourceDerivation') or '').casefold()
+        period_role = str(selected.get('SourcePeriodRole') or '').casefold()
+        if not (
+            'annual_minus_ytd' in derivation
+            or 'annual_minus_q1_q2_q3' in derivation
+            or period_role == 'derived_discrete'
+        ):
+            continue
+        # Direct/reported Q4 cells are never touched.
+        if pd.notna(_num(selected.get('SourceReportedValue'))):
+            continue
+
+        revenue = _num(out.at[revenue_idx, column])
+        cost = _num(out.at[cost_idx, column])
+        gross = _num(out.at[gross_idx, column])
+        op_income = _num(out.at[op_income_idx, column])
+        adjustment = _num(out.at[adjustment_idx, column])
+        if any(pd.isna(value) for value in (
+                revenue, cost, gross, op_income, adjustment)):
+            continue
+        if abs(float(adjustment)) < 1_000_000.0:
+            continue
+        if abs(float(adjustment)) > max(500_000_000.0, 0.02 * abs(float(revenue))):
+            continue
+        if not _close(float(revenue) - float(cost), gross):
+            continue
+
+        if op_expense_idx in out.index:
+            op_expense = _num(out.at[op_expense_idx, column])
+            if pd.notna(op_expense):
+                if not _close(
+                    float(gross) - float(op_expense) + float(adjustment),
+                    op_income,
+                ):
+                    continue
+
+        # Prefer same-period hedge evidence, but permit historical Q4 periods
+        # where the recurring disclosure family exists yet the specific annual
+        # comparative row was not selected into the public output.
+        # Same-period disclosure values can be components of the total hedge
+        # presentation rather than the total itself.  They support the
+        # recurring hedge-to-revenue presentation but are not required to
+        # equal the consolidated accounting residual one-for-one.
+
+        corrected_revenue = float(revenue) + float(adjustment)
+        out.at[revenue_idx, column] = corrected_revenue
+        out.at[gross_idx, column] = float(gross) + float(adjustment)
+        out.at[adjustment_idx, column] = 0.0
+
+        # Keep the exported fact audit aligned with the corrected public CSV.
+        audit_index = selected.name
+        if audit_index in fact_audit.index:
+            fact_audit.at[audit_index, 'Value'] = corrected_revenue
+            fact_audit.at[audit_index, 'SourceDerivation'] = (
+                'revenue_hedging_residual_relocation')
+            if 'SourceDerivationFormula' in fact_audit.columns:
+                fact_audit.at[audit_index, 'SourceDerivationFormula'] = (
+                    f"{float(revenue)} + {float(adjustment)} = "
+                    f"{corrected_revenue}")
+            if 'SourceDerivationExpression' in fact_audit.columns:
+                fact_audit.at[audit_index, 'SourceDerivationExpression'] = (
+                    f"{float(revenue)} + {float(adjustment)} = "
+                    f"{corrected_revenue}")
+            if 'SourceAdmissionRule' in fact_audit.columns:
+                fact_audit.at[audit_index, 'SourceAdmissionRule'] = (
+                    'consolidated_revenue_hedging_residual')
+            if 'SourceVerificationStatus' in fact_audit.columns:
+                fact_audit.at[audit_index, 'SourceVerificationStatus'] = (
+                    globals().get(
+                        '_GB_STATUS_DERIVED_VERIFIED',
+                        'derived_verified'))
+
+        repaired.append(
+            f"{period}: Revenue/Gross Profit {float(adjustment):+,.0f}")
+
+    if repaired:
+        print(
+            "  [Revenue Hedging Residual] Relocated proven Q4 residual(s): "
+            + '; '.join(repaired))
+    out.attrs.update(attrs)
     return out
 
 
@@ -29129,7 +29313,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v53-paired-presentation-reclassification-q4"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v54-revenue-hedging-residual"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
