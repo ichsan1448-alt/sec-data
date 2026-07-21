@@ -1661,7 +1661,6 @@ _FILING_XBRL_CACHE = {}
 _FILING_LOCAL_METADATA_CACHE = {}
 _FILING_PERIOD_REPORT_CACHE = {}
 _FILING_PERIOD_ESTIMATE_CACHE = {}
-_FILING_ACCESSION_KEY_CACHE = {}
 _FILING_URL_CACHE = {}
 _TEXTBLOCK_HTML_TABLES_CACHE = {}
 
@@ -1677,26 +1676,59 @@ def _company_cache_key(company):
 
 
 def _filing_cache_key(filing):
-    # Once an immutable accession is discovered for a Filing object, reuse it.
-    # Do not cache the object-id fallback: a lazy object might expose accession
-    # later, and the old behavior would then switch to the accession key.
-    obj_id = id(filing)
-    cached = _FILING_ACCESSION_KEY_CACHE.get(obj_id)
-    if cached is not None:
-        _profile_count("filing_cache_key_accession_hits")
-        return cached
+    """Return a stable filing identity without memoizing by ``id(filing)``.
+
+    Python may reuse an object id after the original object is collected.  A
+    process-wide ``id -> accession`` memo therefore allows a later filing to
+    inherit an unrelated accession.  Read stable local metadata on every key
+    construction instead.  The final object fallback is process-local only;
+    multi-ticker CLI jobs run in separate child processes.
+    """
+    accession = None
     for attr in ("accession_no", "accession_number"):
         try:
             value = getattr(filing, attr, None)
-            if value:
-                key = ("accession", str(value))
-                _FILING_ACCESSION_KEY_CACHE[obj_id] = key
-                _profile_count("filing_cache_key_accession_misses")
-                return key
         except Exception:
-            pass
+            value = None
+        if value:
+            accession = re.sub(r'[^0-9A-Za-z-]', '', str(value)).strip()
+            if accession:
+                _profile_count("filing_cache_key_accession_hits")
+                return ("accession", accession)
+
+    def _local(attr):
+        try:
+            value = getattr(filing, attr, None)
+        except Exception:
+            value = None
+        return '' if value is None else str(value).strip()
+
+    cik = _local('cik')
+    if not cik:
+        try:
+            cik = str(getattr(getattr(filing, 'company', None), 'cik', '') or '')
+        except Exception:
+            cik = ''
+    form = _local('form')
+    filing_date = _local('filing_date')
+    primary_document = (
+        _local('primary_document') or _local('document')
+        or _local('primary_doc')
+    )
+    file_number = _local('file_number')
+    if any((cik, form, filing_date, primary_document, file_number)):
+        _profile_count("filing_cache_key_metadata_fallbacks")
+        return (
+            "filing_metadata",
+            cik,
+            form,
+            filing_date,
+            primary_document,
+            file_number,
+        )
+
     _profile_count("filing_cache_key_object_fallbacks")
-    return ("object", obj_id)
+    return ("process_local_object", type(filing).__name__, id(filing))
 
 
 
@@ -1797,6 +1829,44 @@ def get_company_filings(company, form):
         filings = _fetch_filings_uncached(company, form)
         with _FETCH_CACHE_LOCK:
             return _FILINGS_CACHE.setdefault(key, filings)
+
+
+@retry_sec_request(retries=3, delay=5)
+def _fetch_company_filings_date_range_uncached(
+        company, form, start_date, end_date):
+    """Fetch a fully loaded company filing collection for one date range."""
+    date_range = f"{start_date}:{end_date}"
+    try:
+        return company.get_filings(
+            form=form,
+            filing_date=date_range,
+            trigger_full_load=True,
+        )
+    except TypeError:
+        # Backward compatibility with older EdgarTools releases.
+        try:
+            return company.get_filings(form=form, filing_date=date_range)
+        except TypeError:
+            return company.get_filings(form=form)
+
+
+def get_company_filings_date_range(company, form, start_date, end_date):
+    """Return date-bounded filings keyed by stable company/date metadata."""
+    key = (
+        _company_cache_key(company),
+        _normalize_form_key(form),
+        str(start_date),
+        str(end_date),
+        'date_range_full_load_v1',
+    )
+    with _FETCH_CACHE_LOCK:
+        cached = _FILINGS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    filings = _fetch_company_filings_date_range_uncached(
+        company, form, start_date, end_date)
+    with _FETCH_CACHE_LOCK:
+        return _FILINGS_CACHE.setdefault(key, filings)
 
 
 def fetch_filings(company, limit):
@@ -2246,6 +2316,594 @@ def _get_textblock_html_tables_cached(value):
         stored = _TEXTBLOCK_HTML_TABLES_CACHE.setdefault(key, tables)
     return tuple(t.copy(deep=True) for t in stored)
 
+
+
+def _gb_q4_earnings_release_target_years_from_facts(
+        facts, *, is_financial=False):
+    """Find historical fiscal years needing a direct Q4 EX-99 family.
+
+    This runs after business-fact reconciliation.  It does not require exact
+    canonical labels at raw extraction time: revenue-family roles are inferred
+    from the canonical label, source label, metric identity and concept.  The
+    EX-99 parser remains the final admission gate, so a broadly discovered year
+    cannot publish data unless a complete direct quarterly revenue family
+    reconciles to total revenue.
+    """
+    if not is_financial or not facts:
+        return set()
+
+    def _role(fact):
+        fields = ' | '.join(str(fact.get(key) or '') for key in (
+            'Label', 'SourceLabel', 'SourceRawLabel',
+            'SourceMetricIdentity', 'Concept'))
+        key = _normalize_label_key(fields)
+        label = _normalize_label_key(fact.get('Label') or '')
+        if label == 'revenue' or re.search(
+                r'\b(?:total net revenues?|total revenues?|net revenues?)\b',
+                key):
+            return 'total'
+        if re.search(r'\btransaction based revenues?\b', key):
+            return 'transaction'
+        if re.search(r'\bnet interest (?:revenues?|income)\b', key):
+            return 'interest'
+        if re.search(r'\bother revenues?\b', key) or label in {
+                'revenue financial service other', 'revenue other'}:
+            return 'other'
+        return None
+
+    by_year = defaultdict(lambda: {
+        'annual': set(), 'direct_q4': {}, 'periods': set()})
+    for fact in facts:
+        role = _role(fact)
+        if role is None:
+            continue
+        try:
+            year = int(float(fact.get('FY')))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        q = str(fact.get('Q') or '')
+        try:
+            duration = int(float(fact.get('Duration') or 0))
+        except (TypeError, ValueError, OverflowError):
+            duration = 0
+        if q in {'Q1','Q2','Q3','Q4'}:
+            by_year[year]['periods'].add(q)
+        if duration >= 300:
+            by_year[year]['annual'].add(role)
+            continue
+        if q != 'Q4' or not 60 <= duration <= 130:
+            continue
+        derivation = str(fact.get('SourceDerivation') or '').strip()
+        directness = str(fact.get('SourceDirectness') or '').casefold()
+        if not (directness == 'reported' or (
+                not derivation and not bool(fact.get('IsCalculated')))):
+            continue
+        scale = pd.to_numeric(pd.Series([
+            fact.get('SourceUnitScale')]), errors='coerce').iloc[0]
+        if pd.isna(scale):
+            scale = float('inf')
+        supplement = bool(
+            str(fact.get('Concept') or '') == 'HTMLEarningsReleaseQ4'
+            or str(fact.get('SourceKind') or '') == 'html_earnings_release')
+        candidate = (supplement, float(scale))
+        prior = by_year[year]['direct_q4'].get(role)
+        if (prior is None or candidate[0] > prior[0]
+                or (candidate[0] == prior[0] and candidate[1] < prior[1])):
+            by_year[year]['direct_q4'][role] = candidate
+
+    targets=set()
+    component_roles={'transaction','interest','other'}
+    for year,evidence in by_year.items():
+        annual=evidence['annual']
+        # The EX-99 table parser is the authoritative admission gate.  Target
+        # discovery is deliberately broader: a consolidated annual revenue fact
+        # plus a recognizable quarterly history is sufficient to search the
+        # corresponding earnings release.  This avoids depending on issuer-
+        # specific component labels before the direct face table is available.
+        if 'total' not in annual:
+            continue
+        has_component_family = len(annual & component_roles) >= 2
+        has_quarter_history = len(evidence['periods'] & {'Q1','Q2','Q3'}) >= 2
+        if not (has_component_family or has_quarter_history):
+            continue
+        direct=evidence['direct_q4']
+        complete=(
+            'total' in direct
+            and len(set(direct) & component_roles) >= 2
+            and all(flag or scale <= 1.0 for flag,scale in direct.values()))
+        if not complete:
+            targets.add(year)
+    return targets
+
+
+
+def _gb_relevant_earnings_release_filings(
+        company, base_filings=None, limit=None, ye_month=12,
+        target_years=None):
+    """Return 8-K filings near fiscal years that actually need Q4 facts.
+
+    ``target_years`` is preferred and is derived from the extracted historical
+    fact set. ``base_filings`` remains a backward-compatible fallback.
+    The scan cap is based on the oldest required year, not on the primary
+    10-K/10-Q ``--limit``.
+    """
+    explicit_targets = {
+        int(year) for year in (target_years or ()) if str(year).strip()
+    }
+
+    q4_period_ends = []
+    if explicit_targets:
+        for fiscal_year in sorted(explicit_targets):
+            try:
+                period_end = (
+                    pd.Timestamp(
+                        year=int(fiscal_year),
+                        month=int(ye_month or 12),
+                        day=1,
+                    )
+                    + pd.offsets.MonthEnd(0)
+                )
+            except Exception:
+                continue
+            q4_period_ends.append(period_end.normalize())
+    else:
+        base = list(base_filings or [])
+        if not base:
+            return []
+        for filing in base:
+            report_date = pd.NaT
+            for attr in ('period_of_report', 'period_end', 'report_date'):
+                try:
+                    value = getattr(filing, attr, None)
+                except Exception:
+                    value = None
+                parsed = pd.to_datetime(value, errors='coerce')
+                if pd.notna(parsed):
+                    report_date = parsed
+                    break
+            if pd.isna(report_date):
+                continue
+            try:
+                form = str(_filing_metadata_value(
+                    filing, 'form', getattr(filing, 'form', '')) or '').upper()
+            except Exception:
+                form = ''
+            try:
+                _fy, quarter = get_period_info(report_date, ye_month)
+            except Exception:
+                quarter = None
+            if form.startswith('10-K') or str(quarter) == 'Q4':
+                q4_period_ends.append(report_date.normalize())
+
+    q4_period_ends = sorted(set(q4_period_ends))
+    if not q4_period_ends:
+        return []
+
+    windows = [
+        (period_end - pd.Timedelta(days=7),
+         period_end + pd.Timedelta(days=130))
+        for period_end in q4_period_ends
+    ]
+    earliest = min(start for start, _end in windows)
+    latest = max(end for _start, end in windows)
+
+    try:
+        collection = get_company_filings_date_range(
+            company,
+            ['8-K', '8-K/A'],
+            earliest.strftime('%Y-%m-%d'),
+            latest.strftime('%Y-%m-%d'),
+        )
+    except Exception:
+        return []
+
+    selected = []
+    for filing in collection:
+        try:
+            meta = _get_filing_local_metadata(filing)
+        except Exception:
+            meta = {}
+        filed = pd.to_datetime(
+            meta.get('filing_date') or getattr(filing, 'filing_date', None),
+            errors='coerce')
+        if pd.isna(filed):
+            continue
+        if filed < earliest or filed > latest:
+            continue
+        if not any(start <= filed <= end for start, end in windows):
+            continue
+
+        try:
+            items = getattr(filing, 'items', None)
+        except Exception:
+            items = None
+        if items:
+            if isinstance(items, str):
+                item_text = items
+            else:
+                try:
+                    item_text = ' '.join(str(item) for item in items)
+                except Exception:
+                    item_text = str(items)
+            if not re.search(r'\b(?:2\.02|7\.01)\b', item_text):
+                continue
+        selected.append(filing)
+    return selected
+
+
+def _gb_earnings_release_supplement_manifest(
+        target_years, filings, admitted_facts=None):
+    """Return a stable cache identity for one historical EX-99 supplement."""
+    filing_ids = []
+    for filing in filings or ():
+        try:
+            meta = _get_filing_local_metadata(filing)
+        except Exception:
+            meta = {}
+        filing_ids.append((
+            str(meta.get('form') or getattr(filing, 'form', '') or ''),
+            str(
+                meta.get('accession_no')
+                or meta.get('accession_number')
+                or safe_filing_id(filing)
+                or ''
+            ),
+            str(meta.get('filing_date') or getattr(
+                filing, 'filing_date', '') or ''),
+        ))
+    return {
+        'target_years': tuple(sorted(
+            int(year) for year in (target_years or ()))),
+        'filings': tuple(sorted(set(filing_ids))),
+        'admitted_facts': int(len(admitted_facts or ())),
+        'parser_version': 'historical-q4-ex99-v2',
+    }
+
+def _gb_attachment_text(attachment):
+    """Return one attachment's HTML/text payload without writing a file."""
+    try:
+        payload = attachment.download()
+    except Exception:
+        payload = None
+    if payload is None:
+        for attr in ('content', 'text', 'html'):
+            try:
+                candidate = getattr(attachment, attr, None)
+                if callable(candidate):
+                    candidate = candidate()
+            except Exception:
+                candidate = None
+            if candidate:
+                payload = candidate
+                break
+    if isinstance(payload, bytes):
+        return payload.decode('utf-8', errors='replace')
+    if payload is None:
+        return ''
+    return str(payload)
+
+
+def _gb_earnings_release_attachment_payloads(filing):
+    """Yield strict EX-99/earnings-release attachment payloads for one 8-K."""
+    try:
+        attachments = filing.attachments
+    except Exception:
+        return []
+
+    payloads = []
+    try:
+        iterator = list(attachments)
+    except Exception:
+        iterator = []
+    for attachment in iterator:
+        fields = []
+        for attr in (
+                'document_type', 'description', 'document', 'filename',
+                'exhibit_number'):
+            try:
+                value = getattr(attachment, attr, None)
+            except Exception:
+                value = None
+            if value:
+                fields.append(str(value))
+        identity = ' | '.join(fields)
+        lower = identity.casefold()
+        is_ex99 = bool(re.search(r'\bex[-\s]?99(?:\.\d+)?\b', lower))
+        is_results = bool(re.search(
+            r'earnings|financial\s+results|quarterly\s+results|press\s+release',
+            lower))
+        is_html = not fields or bool(re.search(r'\.x?html?\b', lower))
+        if not is_html or not (is_ex99 or is_results):
+            continue
+        content = _gb_attachment_text(attachment)
+        if not content or '<table' not in content.casefold():
+            continue
+        try:
+            attachment_url = getattr(attachment, 'url', None)
+        except Exception:
+            attachment_url = None
+        payloads.append((content, attachment_url, identity))
+    return payloads
+
+
+def _gb_earnings_release_q4_label_spec(raw_label, is_financial=False):
+    """Map a small, authoritative revenue-family face table vocabulary."""
+    label = _gb_row_label(raw_label).rstrip(':').strip()
+    key = _normalize_label_key(label)
+    if key in {
+            'total net revenues', 'total net revenue',
+            'net revenues', 'net revenue',
+            'total revenues', 'total revenue'}:
+        return '1_Income_Statement', 'Revenue', 'revenue'
+    if key in {
+            'transaction based revenues', 'transaction based revenue'}:
+        return (
+            '1_Income_Statement',
+            'Revenue - Transaction Based Revenues',
+            'transaction based revenues')
+    if key in {
+            'net interest revenues', 'net interest revenue',
+            'net interest income'}:
+        return (
+            '1_Income_Statement',
+            'Net Interest Income (Expense)',
+            'net interest income')
+    if key in {'other revenues', 'other revenue'}:
+        if is_financial:
+            return (
+                '4a_Segments_Business',
+                'Revenue - Financial Service Other',
+                'other revenues')
+        return '1_Income_Statement', 'Revenue - Other', 'other revenues'
+    return None
+
+
+def _gb_earnings_release_table_context(table_tag):
+    preceding = []
+    try:
+        for node in table_tag.find_all_previous(string=True, limit=30):
+            text = _gb_clean_text(node)
+            if text:
+                preceding.append(text)
+    except Exception:
+        preceding = []
+    preceding = list(reversed(preceding))
+    try:
+        table_text = _gb_clean_text(table_tag.get_text(' ', strip=True))
+    except Exception:
+        table_text = ''
+    return _gb_clean_text(' | '.join(preceding[-20:] + [table_text]))
+
+
+def _gb_extract_direct_q4_face_facts_from_earnings_release_html(
+        html_content, *, filed, accession, filing_url,
+        target_years, ye_month, is_financial=False):
+    """Extract direct Q4 revenue-family facts from one EX-99 statement table.
+
+    Admission is intentionally narrow: the table must identify a consolidated
+    statement of operations (or expose the complete revenue family), include a
+    three-month period ending in fiscal Q4, and contain total revenue plus at
+    least two of transaction revenue, net interest revenue, and other revenue.
+    Annual and sequential-quarter columns are ignored.
+    """
+    if not html_content:
+        return []
+    targets = {int(year) for year in target_years or ()}
+    if not targets:
+        return []
+
+    soup = BeautifulSoup(str(html_content), 'html.parser')
+    for hidden in soup.find_all(style=_DISPLAY_NONE_RE):
+        hidden.decompose()
+
+    accepted = []
+    seen = set()
+    for table_number, table_tag in enumerate(soup.find_all('table')):
+        context = _gb_earnings_release_table_context(table_tag)
+        try:
+            frames = pd.read_html(StringIO(str(table_tag)))
+        except Exception:
+            continue
+        for frame_number, frame in enumerate(frames):
+            if frame is None or frame.empty or len(frame.columns) < 2:
+                continue
+            frame = frame.dropna(how='all', axis=0).dropna(how='all', axis=1)
+            if frame.empty:
+                continue
+
+            # Find the row-label column by the number of recognized face rows.
+            label_position = None
+            label_specs = {}
+            best_score = 0
+            for col_pos in range(min(4, len(frame.columns))):
+                mapped = {}
+                for row_pos, raw in enumerate(frame.iloc[:, col_pos].tolist()):
+                    spec = _gb_earnings_release_q4_label_spec(
+                        raw, is_financial=is_financial)
+                    if spec is not None:
+                        mapped[row_pos] = spec
+                if len(mapped) > best_score:
+                    label_position = col_pos
+                    label_specs = mapped
+                    best_score = len(mapped)
+            if label_position is None or best_score < 3:
+                continue
+            mapped_labels = {spec[1] for spec in label_specs.values()}
+            if 'Revenue' not in mapped_labels:
+                continue
+            component_count = len(mapped_labels.intersection({
+                'Revenue - Transaction Based Revenues',
+                'Net Interest Income (Expense)',
+                'Revenue - Financial Service Other',
+                'Revenue - Other',
+            }))
+            if component_count < 2:
+                continue
+
+            corpus = _gb_clean_text(
+                context + ' | ' + _gb_table_role_corpus(frame, frame, ''))
+            has_statement_anchor = bool(re.search(
+                r'consolidated\s+statements?\s+of\s+operations|'
+                r'statements?\s+of\s+operations', corpus, re.I))
+            if not has_statement_anchor and component_count < 3:
+                continue
+
+            scale = _gb_detect_scale(corpus, frame)
+            if scale is None:
+                continue
+            table_fingerprint = _gb_table_fingerprint(frame)
+
+            for year in sorted(targets):
+                normalized = _gb_normalize_table_grid(frame, year)
+                if normalized.empty:
+                    continue
+                value_position, value_header = _gb_select_current_value_column(
+                    normalized, year, 90)
+                if value_position is None:
+                    continue
+                header_text = _gb_clean_text(value_header)
+                if not re.search(r'three\s+months?\s+ended', header_text, re.I):
+                    continue
+                fallback_end = pd.Timestamp(
+                    year=year,
+                    month=int(ye_month or 12),
+                    day=1,
+                ) + pd.offsets.MonthEnd(0)
+                end_dt = _gb_period_end_from_value_header(
+                    header_text, fallback_end)
+                if pd.isna(end_dt):
+                    continue
+                fiscal_year, quarter = get_period_info(end_dt, ye_month)
+                if int(fiscal_year) != int(year) or str(quarter) != 'Q4':
+                    continue
+
+                value_positions = _gb_equivalent_period_columns(
+                    normalized, value_position, value_header)
+                for row_pos, spec in label_specs.items():
+                    if row_pos >= len(normalized):
+                        continue
+                    row = normalized.iloc[row_pos].tolist()
+                    value, raw_value = _gb_coalesced_period_value(
+                        row, value_positions)
+                    if value is None:
+                        continue
+                    category, label, metric_identity = spec
+                    scaled = float(value) * float(scale)
+                    nearest = round(scaled)
+                    if abs(scaled - nearest) <= max(
+                            1e-6, abs(scaled) * 1e-12):
+                        scaled = float(nearest)
+                    key = (category, label, int(fiscal_year), scaled, accession)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    duration = _gb_duration_from_header(header_text, 90)
+                    start_dt = end_dt - pd.Timedelta(days=int(duration))
+                    accepted.append({
+                        'Category': category,
+                        'Label': label,
+                        'Value': scaled,
+                        'FY': int(fiscal_year),
+                        'Q': 'Q4',
+                        'End': end_dt.strftime('%Y-%m-%d'),
+                        'Start': start_dt.strftime('%Y-%m-%d'),
+                        'Duration': int(duration),
+                        'Filed': str(filed or ''),
+                        'Accession': str(accession or ''),
+                        'TagRank': -5,
+                        'DimCount': 0,
+                        'IsCalculated': False,
+                        'Concept': 'HTMLEarningsReleaseQ4',
+                        'FilingUrl': filing_url,
+                        'SourceLabel': _gb_clean_text(
+                            normalized.iloc[row_pos, label_position]),
+                        'SourceRawLabel': _gb_clean_text(
+                            normalized.iloc[row_pos, label_position]),
+                        'SourceValueHeader': header_text,
+                        'SourceRawValue': raw_value,
+                        'SourceDisplayDecimals': _gb_display_decimal_places(
+                            raw_value),
+                        'SourceUnitKind': 'money',
+                        'SourceUnitScale': float(scale),
+                        'SourceUnitConfidence': 0.995,
+                        'SourceUnitEvidence': 'earnings-release-table-scale',
+                        'SourcePeriodBasis': _GB_BASIS_DURATION_FLOW,
+                        'SourceBasisConfidence': 0.995,
+                        'SourceMetricIdentity': metric_identity,
+                        'SourceKind': 'html_earnings_release',
+                        'SourceAdmissionRule': (
+                            'earnings_release_direct_q4_face_table'),
+                        'SourceDirectness': 'reported',
+                        'SourcePeriodRole': 'direct_discrete',
+                        'SourceDerivation': np.nan,
+                        'SourceTableRole': 'consolidated_statement_operations',
+                        'SourceTableGeometry': 'earnings_release_period_columns',
+                        'SourceTableFingerprint': table_fingerprint,
+                        'SourceRowOrdinal': int(
+                            table_number * 100_000
+                            + frame_number * 10_000
+                            + row_pos * 100
+                            + value_position),
+                    })
+    return accepted
+
+
+def _gb_extract_direct_q4_facts_from_earnings_release_filings(
+        filings, target_years, ye_month, is_financial=False,
+        diagnostics=None):
+    """Extract strict direct-Q4 face rows from nearby 8-K EX-99 exhibits."""
+    targets = {int(year) for year in target_years or ()}
+    if not targets:
+        return []
+    extracted = []
+    filing_count = 0
+    attachment_count = 0
+    for filing in filings or ():
+        filing_count += 1
+        try:
+            meta = _get_filing_local_metadata(filing)
+        except Exception:
+            meta = {}
+        filed = meta.get('filing_date') or getattr(
+            filing, 'filing_date', '')
+        accession = (
+            meta.get('accession_no')
+            or meta.get('accession_number')
+            or safe_filing_id(filing)
+        )
+        try:
+            base_url = _get_filing_url_cached(filing)
+        except Exception:
+            base_url = None
+        for content, attachment_url, _identity in (
+                _gb_earnings_release_attachment_payloads(filing)):
+            attachment_count += 1
+            extracted.extend(
+                _gb_extract_direct_q4_face_facts_from_earnings_release_html(
+                    content,
+                    filed=filed,
+                    accession=accession,
+                    filing_url=attachment_url or base_url,
+                    target_years=targets,
+                    ye_month=ye_month,
+                    is_financial=is_financial,
+                )
+            )
+    if diagnostics is not None:
+        diagnostics.update({
+            'filings': int(filing_count),
+            'attachments': int(attachment_count),
+            'facts': int(len(extracted)),
+            'years': tuple(sorted({
+                int(float(fact.get('FY'))) for fact in extracted
+                if fact.get('FY') is not None
+            })),
+        })
+    if extracted:
+        print(
+            f"  [Earnings Release Q4] Admitted {len(extracted)} direct "
+            "face-statement fact(s) from EX-99 exhibits.")
+    return extracted
 
 def _build_filing_period_lookup(filings, ye_month, wanted_periods=None):
     """Map period column (YYYY-Qn) to the first matching filing.
@@ -7922,11 +8580,116 @@ def _gb_columnar_segment_period_blocks(
     return blocks
 
 
+
+_GB_EXPLICIT_TABLE_PERIOD_RE = re.compile(
+    r'((?:Three|Six|Nine|Twelve)\s+Months?\s+Ended\s+'
+    r'(?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)\s+\d{1,2},?\s+20\d{2}|'
+    r'(?:Year|Fiscal\s+Year)\s+Ended\s+'
+    r'(?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)\s+\d{1,2},?\s+20\d{2})',
+    re.I,
+)
+
+
+def _gb_explicit_period_heading_from_text(text):
+    """Return the first complete duration/date/year heading in local context."""
+    corpus = _gb_clean_text(text)
+    if not corpus:
+        return ''
+    match = _GB_EXPLICIT_TABLE_PERIOD_RE.search(corpus)
+    return _gb_clean_text(match.group(1)) if match else ''
+
+
+def _gb_nearest_explicit_period_heading_for_table(
+        table_tag, fallback_context=''):
+    """Find the closest governing period heading for one HTML leaf table."""
+    try:
+        siblings = table_tag.previous_siblings
+    except Exception:
+        siblings = ()
+    inspected = 0
+    for sibling in siblings:
+        inspected += 1
+        if inspected > 40:
+            break
+        try:
+            text = _gb_clean_text(
+                sibling.get_text(' ', strip=True)
+                if hasattr(sibling, 'get_text') else sibling)
+        except Exception:
+            text = _gb_clean_text(sibling)
+        heading = _gb_explicit_period_heading_from_text(text)
+        if heading:
+            return heading
+        if getattr(sibling, 'name', None) == 'table':
+            break
+
+    try:
+        previous_strings = table_tag.find_all_previous(
+            string=True, limit=120)
+    except Exception:
+        previous_strings = ()
+    for node in previous_strings:
+        heading = _gb_explicit_period_heading_from_text(node)
+        if heading:
+            return heading
+    return _gb_explicit_period_heading_from_text(fallback_context)
+
+def _gb_columnar_period_header_for_year(
+        context: str, year: int, preferred_duration: int) -> str:
+    """Return the most specific duration/date heading for one table year."""
+    corpus = _gb_clean_text(context)
+    month = (
+        r'(?:January|February|March|April|May|June|July|August|September|'
+        r'October|November|December)')
+    patterns = (
+        rf'((?:Three|Six|Nine|Twelve)\s+Months?\s+Ended\s+'
+        rf'{month}\s+\d{{1,2}},?\s+{int(year)})',
+        rf'(Year\s+Ended\s+{month}\s+\d{{1,2}},?\s+{int(year)})',
+        rf'(Fiscal\s+Year\s+Ended\s+{month}\s+\d{{1,2}},?\s+{int(year)})',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, corpus, flags=re.I)
+        if match:
+            return _gb_clean_text(match.group(1))
+
+    # Some SEC grids repeat the year in a dedicated row while the duration/date
+    # caption appears only once above the full table.  Preserve that caption and
+    # append the requested year so period-end parsing does not fall back to the
+    # first comparative block.
+    duration_patterns = (
+        rf'((?:Three|Six|Nine|Twelve)\s+Months?\s+Ended\s+'
+        rf'{month}\s+\d{{1,2}})',
+        rf'(Year\s+Ended\s+{month}\s+\d{{1,2}})',
+        rf'(Fiscal\s+Year\s+Ended\s+{month}\s+\d{{1,2}})',
+    )
+    for pattern in duration_patterns:
+        match = re.search(pattern, corpus, flags=re.I)
+        if match:
+            return f"{_gb_clean_text(match.group(1))}, {int(year)}"
+
+    if int(preferred_duration or 90) >= 300:
+        return f'Year Ended December 31, {int(year)}'
+    return str(int(year))
+
+
 def _gb_extract_columnar_segment_candidates_from_grid(
         df: pd.DataFrame, context: str, current_year: int,
         preferred_duration: int = 90, reference_magnitude=None,
         value_header: str | None = None, ordinal_base: int = 0):
-    """Extract one already-isolated columnar segment period block."""
+    """Extract one columnar segment table without cross-year coalescing.
+
+    Real SEC tables frequently encode periods horizontally inside repeated
+    member columns, for example ``Mobility, Mobility.1, Delivery, Delivery.1``
+    with a separate 2024/2025 year row.  The old implementation grouped both
+    Mobility columns and returned the first numeric cell, causing a comparative
+    value to be labeled as the current period.  This implementation detects a
+    common numeric subcolumn count across the reportable members, maps each slot
+    to the explicit years in the table corpus, and emits one complete candidate
+    family per year.  A family is later accepted or rejected as a unit by the
+    segment-closure gate.
+    """
     if df is None or df.empty or len(df.columns) < 3:
         return []
 
@@ -7973,10 +8736,100 @@ def _gb_extract_columnar_segment_candidates_from_grid(
     table_scale = _gb_detect_scale(context, df)
     if table_scale is None:
         return []
+
+    # Keep only positions that contain a numeric value (or a rendered dash for
+    # Segment Adjusted EBITDA) in at least one recognized metric row.  Currency
+    # decorator columns therefore do not look like extra periods.
+    numeric_positions = {}
+    for member_key, positions in member_positions.items():
+        usable = []
+        for position, member in positions:
+            has_value = False
+            for _, row, _, (prefix, _detail) in specs:
+                if position >= len(row):
+                    continue
+                parsed, _raw = _gb_parse_number(row[position])
+                if parsed is not None:
+                    has_value = True
+                    break
+                if (
+                    prefix == 'Adjusted Segment EBITDA'
+                    and _gb_is_explicit_zero_dash(row[position])
+                ):
+                    has_value = True
+                    break
+            if has_value:
+                usable.append((position, member))
+        if usable:
+            numeric_positions[member_key] = sorted(usable)
+
+    if len(numeric_positions) < 2:
+        return []
+
+    # Detect a horizontal period grid only when at least two members share the
+    # same repeated numeric-column count and the table/context exposes enough
+    # explicit years.  Otherwise retain the legacy one-period coalescing path.
+    counts = [len(positions) for positions in numeric_positions.values()]
+    repeated_count = min(counts) if counts else 1
+    all_same_count = bool(counts and len(set(counts)) == 1)
+    context_years = sorted({
+        int(year) for year in re.findall(
+            r'\b(20\d{2})\b',
+            ' | '.join([
+                str(context or ''),
+                ' | '.join(_gb_flatten_column(column) for column in df.columns),
+                ' | '.join(
+                    _gb_clean_text(value)
+                    for row in df.head(8).itertuples(index=False, name=None)
+                    for value in row
+                ),
+            ])
+        )
+        if int(year) <= int(current_year)
+        and int(year) >= int(current_year) - 8
+    })
+
+    period_plans = []
+    if (
+        all_same_count
+        and repeated_count >= 2
+        and len(context_years) >= repeated_count
+    ):
+        slot_years = context_years[-repeated_count:]
+        for slot, slot_year in enumerate(slot_years):
+            slot_positions = {
+                member_key: [positions[slot]]
+                for member_key, positions in numeric_positions.items()
+            }
+            slot_header = _gb_columnar_period_header_for_year(
+                corpus, slot_year, int(preferred_duration))
+            slot_role = (
+                'current' if int(slot_year) == int(current_year)
+                else 'comparative')
+            period_plans.append((
+                slot_positions, slot_header, slot_role,
+                int(ordinal_base + slot * 1_000_000),
+            ))
+    else:
+        explicit_header = _gb_clean_text(value_header) or str(current_year)
+        header_years = [
+            int(year) for year in re.findall(
+                r'\b(20\d{2})\b', explicit_header)
+        ]
+        period_role = (
+            'current'
+            if int(current_year) in header_years
+            else ('comparative' if header_years else None)
+        )
+        period_plans.append((
+            numeric_positions, explicit_header, period_role,
+            int(ordinal_base),
+        ))
+
     if float(table_scale) == 1.0 and reference_magnitude:
         displayed = []
         for _, row, _, _ in specs:
-            for positions in member_positions.values():
+            for positions in numeric_positions.values():
                 value, _ = _gb_coalesced_period_value(
                     row, [position for position, _ in positions])
                 if value is not None:
@@ -7995,113 +8848,107 @@ def _gb_extract_columnar_segment_candidates_from_grid(
             if plausible:
                 table_scale = min(plausible)[1]
 
-    explicit_header = _gb_clean_text(value_header) or str(current_year)
-    duration = _gb_duration_from_header(
-        explicit_header, int(preferred_duration))
-    header_years = [
-        int(year) for year in re.findall(r'\b(20\d{2})\b', explicit_header)
-    ]
-    period_role = (
-        'current'
-        if int(current_year) in header_years
-        else ('comparative' if header_years else None)
-    )
-
     candidates = []
-    for ordinal, row, raw_label, (prefix, detail) in specs:
-        for positions in member_positions.values():
-            member = positions[0][1]
-            value, raw_value = _gb_coalesced_period_value(
-                row, [position for position, _ in positions])
-            contextual_dash_zero = False
-            if value is None:
-                raw_cells = [
-                    _gb_clean_text(row[position])
-                    for position, _ in positions
-                    if position < len(row)
-                    and _gb_clean_text(row[position])
-                ]
-                normalized_dash_cells = {
-                    re.sub(r'[\s$€£¥()]', '', cell)
-                    for cell in raw_cells
-                }
-                dash_tokens = {'-', '–', '—', '−'}
-                if (
-                    prefix == 'Adjusted Segment EBITDA'
-                    and raw_cells
-                    and normalized_dash_cells
-                    and normalized_dash_cells.issubset(dash_tokens)
-                ):
-                    # Admit as a provisional zero only.  The family-closure
-                    # filter below must prove the zero from either the member
-                    # P&L identity or the complete segment-to-total
-                    # reconciliation before it can survive publication.
-                    value = 0.0
-                    raw_value = raw_cells[0]
-                    contextual_dash_zero = True
+    for plan_positions, explicit_header, period_role, plan_ordinal in period_plans:
+        duration = _gb_duration_from_header(
+            explicit_header, int(preferred_duration))
+        for ordinal, row, raw_label, (prefix, detail) in specs:
+            for positions in plan_positions.values():
+                member = positions[0][1]
+                value, raw_value = _gb_coalesced_period_value(
+                    row, [position for position, _ in positions])
+                contextual_dash_zero = False
+                if value is None:
+                    raw_cells = [
+                        _gb_clean_text(row[position])
+                        for position, _ in positions
+                        if position < len(row)
+                        and _gb_clean_text(row[position])
+                    ]
+                    normalized_dash_cells = {
+                        re.sub(r'[\s$€£¥()]', '', cell)
+                        for cell in raw_cells
+                    }
+                    dash_tokens = {'-', '–', '—', '−'}
+                    if (
+                        prefix == 'Adjusted Segment EBITDA'
+                        and raw_cells
+                        and normalized_dash_cells
+                        and normalized_dash_cells.issubset(dash_tokens)
+                    ):
+                        value = 0.0
+                        raw_value = raw_cells[0]
+                        contextual_dash_zero = True
+                    else:
+                        continue
+                if detail:
+                    display_label = f'{prefix} - {member} - {detail}'
+                    metric_identity = _normalize_label_key(
+                        f'{prefix} {detail}')
                 else:
-                    continue
-            if detail:
-                display_label = f'{prefix} - {member} - {detail}'
-                metric_identity = _normalize_label_key(
-                    f'{prefix} {detail}')
-            else:
-                display_label = f'{prefix} - {member}'
-                metric_identity = _normalize_label_key(prefix)
-            period_basis = (
-                _GB_BASIS_INSTANT_END
-                if prefix == 'Assets'
-                else _GB_BASIS_DURATION_FLOW)
-            scaled = float(value) * float(table_scale)
-            if prefix in {
-                    'Significant Segment Expenses',
-                    'Depreciation & Amortization'}:
-                scaled = abs(scaled)
-            nearest = round(scaled)
-            if abs(scaled - nearest) <= max(
-                    1e-6, abs(scaled) * 1e-12):
-                scaled = float(nearest)
-            candidates.append({
-                'SourceLabel': raw_label,
-                'RawSourceLabel': raw_label,
-                'Label': display_label,
-                'Value': scaled,
-                'RawValue': raw_value,
-                'DisplayDecimals': _gb_display_decimal_places(raw_value),
-                'Scale': float(table_scale),
-                'UnitKind': 'money',
-                'UnitConfidence': 0.99,
-                'UnitEvidence': 'columnar-segment-table-scale',
-                'Prefix': prefix,
-                'Confidence': 0.995,
-                'PeriodBasis': period_basis,
-                'BasisConfidence': 0.995,
-                'TableRole': (
-                    _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE
-                    if prefix == 'Adjusted Segment EBITDA'
-                    else (
-                        _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
-                        if prefix == 'Significant Segment Expenses'
-                        else _GB_ROLE_REPORTABLE_SEGMENT_PNL)),
-                'TableGeometry': 'metric_rows_segment_columns',
-                'AnalyticalBasis': 'reportable_segment_pnl',
-                'Category': '4a_Segments_Business',
-                'SemanticType': prefix,
-                'AdmissionRule': (
-                    'columnar_segment_table_contextual_dash_zero'
-                    if contextual_dash_zero
-                    else 'columnar_segment_table'),
-                'ContextualDashZero': bool(contextual_dash_zero),
-                'MetricFamily': None,
-                'MetricIdentity': metric_identity,
-                'Duration': (
-                    0 if period_basis == _GB_BASIS_INSTANT_END
-                    else duration),
-                'ValueHeader': explicit_header,
-                'PeriodRole': period_role,
-                'SourceRowOrdinal': int(
-                    ordinal_base + ordinal * 100 + positions[0][0]),
-            })
+                    display_label = f'{prefix} - {member}'
+                    metric_identity = _normalize_label_key(prefix)
+                period_basis = (
+                    _GB_BASIS_INSTANT_END
+                    if prefix == 'Assets'
+                    else _GB_BASIS_DURATION_FLOW)
+                scaled = float(value) * float(table_scale)
+                if prefix in {
+                        'Significant Segment Expenses',
+                        'Depreciation & Amortization'}:
+                    scaled = abs(scaled)
+                nearest = round(scaled)
+                if abs(scaled - nearest) <= max(
+                        1e-6, abs(scaled) * 1e-12):
+                    scaled = float(nearest)
+                candidates.append({
+                    'SourceLabel': raw_label,
+                    'RawSourceLabel': raw_label,
+                    'Label': display_label,
+                    'Value': scaled,
+                    'RawValue': raw_value,
+                    'DisplayDecimals': _gb_display_decimal_places(raw_value),
+                    'Scale': float(table_scale),
+                    'UnitKind': 'money',
+                    'UnitConfidence': 0.99,
+                    'UnitEvidence': 'columnar-segment-table-scale',
+                    'Prefix': prefix,
+                    'Confidence': 0.995,
+                    'PeriodBasis': period_basis,
+                    'BasisConfidence': 0.995,
+                    'TableRole': (
+                        _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE
+                        if prefix == 'Adjusted Segment EBITDA'
+                        else (
+                            _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE
+                            if prefix == 'Significant Segment Expenses'
+                            else _GB_ROLE_REPORTABLE_SEGMENT_PNL)),
+                    'TableGeometry': (
+                        'metric_rows_segment_columns_period_slots'
+                        if len(period_plans) > 1
+                        else 'metric_rows_segment_columns'),
+                    'AnalyticalBasis': 'reportable_segment_pnl',
+                    'Category': '4a_Segments_Business',
+                    'SemanticType': prefix,
+                    'AdmissionRule': (
+                        'columnar_segment_table_contextual_dash_zero'
+                        if contextual_dash_zero
+                        else (
+                            'columnar_segment_table_period_slot'
+                            if len(period_plans) > 1
+                            else 'columnar_segment_table')),
+                    'ContextualDashZero': bool(contextual_dash_zero),
+                    'MetricFamily': None,
+                    'MetricIdentity': metric_identity,
+                    'Duration': (
+                        0 if period_basis == _GB_BASIS_INSTANT_END
+                        else duration),
+                    'ValueHeader': explicit_header,
+                    'PeriodRole': period_role,
+                    'SourceRowOrdinal': int(
+                        plan_ordinal + ordinal * 100 + positions[0][0]),
+                })
+
     return candidates if len(candidates) >= 4 else []
 
 
@@ -8265,6 +9112,13 @@ def _gb_filter_columnar_segment_family_closure(candidates):
                     f"{value_header or 'unknown period'} "
                     "(unproven dash-as-zero candidate)")
 
+        if len(complete) >= 2 and not failed:
+            for candidate in rows:
+                if str(candidate.get('Label') or '').startswith(
+                        'Adjusted Segment EBITDA - '):
+                    candidate['AtomicSegmentEBITDAFamily'] = True
+                    candidate['AdmissionRule'] = (
+                        'columnar_adjusted_segment_ebitda_atomic_family')
         kept.extend(rows)
 
     if rejected:
@@ -8277,7 +9131,8 @@ def _gb_filter_columnar_segment_family_closure(candidates):
 
 def _extract_columnar_segment_breakdown_from_table(
         table: pd.DataFrame, context: str, current_year: int,
-        preferred_duration: int = 90, reference_magnitude=None):
+        preferred_duration: int = 90, reference_magnitude=None,
+        explicit_value_header=None):
     """Extract metric-rows × segment-columns tables without period drift.
 
     Repeated comparative/current blocks are parsed separately and retain their
@@ -8305,8 +9160,24 @@ def _extract_columnar_segment_breakdown_from_table(
     df = _gb_prepare_columnar_segment_grid(table)
     if df.empty:
         return []
-    return _gb_filter_columnar_segment_family_closure(
-        _gb_extract_columnar_segment_candidates_from_grid(
+    explicit_header = _gb_explicit_period_heading_from_text(
+        explicit_value_header or '')
+    table_text = _gb_clean_text(
+        ' | '.join(
+            _gb_clean_text(value)
+            for row in df.head(20).itertuples(index=False, name=None)
+            for value in row
+        )
+    )
+    contains_company_measure = bool(re.search(
+        r'(?:segment\s+adjusted|adjusted\s+segment)\s+ebitda',
+        table_text, re.I))
+    if contains_company_measure and not explicit_header:
+        # A horizontal comparative/current grid can prove its periods from the
+        # repeated physical member columns plus explicit years in the local
+        # context. Let the grid parser construct those families first. Only an
+        # unresolved single-period table is rejected as ambiguous.
+        provisional = _gb_extract_columnar_segment_candidates_from_grid(
             df,
             context,
             current_year,
@@ -8315,7 +9186,254 @@ def _extract_columnar_segment_breakdown_from_table(
             value_header=str(current_year),
             ordinal_base=0,
         )
+        provisional_headers = {
+            _gb_clean_text(row.get('ValueHeader')) for row in provisional
+            if re.search(r'\b20\d{2}\b', _gb_clean_text(
+                row.get('ValueHeader')))
+        }
+        if len(provisional_headers) >= 2:
+            durations = {
+                int(float(row.get('Duration') or preferred_duration))
+                for row in provisional
+            }
+            if all(60 <= duration <= 130 or duration >= 300
+                   for duration in durations):
+                return _gb_filter_columnar_segment_family_closure(
+                    provisional)
+        # A single-period company-defined measure table without a governing
+        # period is ambiguous. Never assign it to the filing year by default.
+        return []
+    if explicit_header:
+        explicit_duration = _gb_duration_from_header(
+            explicit_header, preferred_duration)
+        if contains_company_measure and not (
+                60 <= explicit_duration <= 130 or explicit_duration >= 300):
+            return []
+    return _gb_filter_columnar_segment_family_closure(
+        _gb_extract_columnar_segment_candidates_from_grid(
+            df,
+            context,
+            current_year,
+            preferred_duration=preferred_duration,
+            reference_magnitude=reference_magnitude,
+            value_header=(explicit_header or str(current_year)),
+            ordinal_base=0,
+        )
     )
+
+
+
+def _gb_adjusted_segment_ebitda_member_role(raw_label):
+    """Classify a row in a member-rows × period-columns EBITDA table."""
+    label = _gb_row_label(raw_label).rstrip(':').strip()
+    key = _normalize_label_key(label)
+    if not label or not re.search(r'[A-Za-z]', label):
+        return None
+    if re.fullmatch(r'(?:total )?adjusted ebitda', key):
+        return 'total', 'Adjusted EBITDA'
+    if re.search(
+            r'\b(?:corporate|unallocated|central|reconciling)\b', key
+            ) or re.search(r'platform r(?:esearch and )?d', key):
+        return 'reconciliation', label
+    if (
+        re.search(r'\b(?:percent|percentage|change|margin|revenue)\b', key)
+        or key in {'segment', 'segments', 'metric', 'total'}
+        or re.fullmatch(r'(?:three|six|nine|twelve) months ended.*', key)
+    ):
+        return None
+    return 'segment', label
+
+
+def _gb_extract_adjusted_segment_ebitda_period_table(
+        table, context, current_year, preferred_duration=90,
+        reference_magnitude=None):
+    """Extract one complete, issuer-agnostic Segment Adjusted EBITDA family.
+
+    Only discrete three-month or annual member-rows × explicit-period-columns
+    tables are eligible. Six- and nine-month YTD values are rejected here and
+    therefore cannot be published as discrete quarters. The physical header of
+    each value column owns its year; years are never sorted and reassigned.
+    """
+    if table is None or table.empty:
+        return []
+    table_corpus = _gb_clean_text(
+        _gb_table_role_corpus(table, table, ''))
+    local_context = _gb_clean_text(context)
+    table_has_metric = bool(re.search(
+        r'\bsegment\s+adjusted\s+ebitda\b', table_corpus, re.I))
+    context_has_metric = bool(re.search(
+        r'\bsegment\s+adjusted\s+ebitda\b', local_context, re.I))
+    if not (table_has_metric or context_has_metric):
+        return []
+    corpus = _gb_clean_text(f'{local_context} {table_corpus}')
+    duration = _gb_duration_from_header(corpus, int(preferred_duration))
+    if not (60 <= duration <= 130 or duration >= 300):
+        return []
+
+    df = table.copy().dropna(how='all', axis=0).dropna(how='all', axis=1)
+    if df.empty or len(df.columns) < 2:
+        return []
+    df.columns = [_gb_flatten_column(column) for column in df.columns]
+
+    label_pos = None
+    best = 0
+    for pos in range(min(4, len(df.columns))):
+        score = sum(
+            _gb_adjusted_segment_ebitda_member_role(value) is not None
+            for value in df.iloc[:, pos].tolist()
+        )
+        if score > best:
+            best = score
+            label_pos = pos
+    if label_pos is None or best < 4:
+        return []
+
+    year_by_pos = {}
+    for pos, column in enumerate(df.columns):
+        if pos == label_pos:
+            continue
+        years = re.findall(r'\b(20\d{2})\b', str(column))
+        if years:
+            year_by_pos[pos] = int(years[-1])
+    if len(year_by_pos) < 2:
+        for row_pos in range(min(8, len(df))):
+            row_years = {}
+            for pos, value in enumerate(df.iloc[row_pos].tolist()):
+                if pos == label_pos:
+                    continue
+                match = re.fullmatch(
+                    r'\s*(20\d{2})\s*', _gb_clean_text(value))
+                if match:
+                    row_years[pos] = int(match.group(1))
+            if len(row_years) >= 2:
+                year_by_pos = row_years
+                df = df.drop(df.index[row_pos]).reset_index(drop=True)
+                break
+    if not year_by_pos:
+        return []
+
+    scale = _gb_detect_scale(corpus, df)
+    if scale is None:
+        return []
+
+    member_rows = []
+    for _, row in df.iterrows():
+        classified = _gb_adjusted_segment_ebitda_member_role(
+            row.iloc[label_pos])
+        if classified is None:
+            continue
+        role, member = classified
+        member_rows.append((role, member, row, _gb_clean_text(
+            row.iloc[label_pos])))
+    reportable = [item for item in member_rows if item[0] == 'segment']
+    totals = [item for item in member_rows if item[0] == 'total']
+    if len(reportable) < 2 or len(totals) != 1:
+        return []
+
+    # A nearby EBITDA heading must not relabel a separate geographic revenue
+    # table.  If every reportable member is geographic, require the metric text
+    # to be physically present in the table itself rather than only in prose.
+    geographic_members = sum(
+        _classify_geographic_member(item[1], False) is not None
+        or bool(_GB_GEOGRAPHIC_TEXT_RE.search(str(item[1])))
+        for item in reportable
+    )
+    if geographic_members == len(reportable) and not table_has_metric:
+        return []
+
+    candidates = []
+    for pos, year in year_by_pos.items():
+        if year > int(current_year) or year < int(current_year) - 8:
+            continue
+        parsed_rows = []
+        invalid = False
+        for role, member, row, raw_label in member_rows:
+            if pos >= len(row):
+                invalid = True
+                break
+            value, raw_value = _gb_parse_number(row.iloc[pos])
+            dash_zero = False
+            if value is None and role == 'segment' and _gb_is_explicit_zero_dash(
+                    row.iloc[pos]):
+                value = 0.0
+                raw_value = _gb_clean_text(row.iloc[pos])
+                dash_zero = True
+            if value is None:
+                invalid = True
+                break
+            parsed_rows.append({
+                'role': role,
+                'member': member,
+                'raw_label': raw_label,
+                'raw_value': raw_value,
+                'value': float(value) * float(scale),
+                'dash_zero': dash_zero,
+            })
+        if invalid:
+            continue
+
+        segment_sum = sum(
+            item['value'] for item in parsed_rows
+            if item['role'] == 'segment')
+        reconciliation_sum = sum(
+            item['value'] for item in parsed_rows
+            if item['role'] == 'reconciliation')
+        total_value = next(
+            item['value'] for item in parsed_rows
+            if item['role'] == 'total')
+        implied = segment_sum + reconciliation_sum
+        tolerance = max(
+            2_000_000.0,
+            0.0015 * max(abs(implied), abs(total_value), 1.0),
+        )
+        if abs(implied - total_value) > tolerance:
+            continue
+
+        header = _gb_columnar_period_header_for_year(
+            corpus, year, duration)
+        if duration < 300 and not re.search(
+                r'three\s+months?\s+ended', header, re.I):
+            continue
+        if duration >= 300 and not re.search(
+                r'(?:year|twelve\s+months?)\s+ended', header, re.I):
+            continue
+        period_role = (
+            'current' if year == int(current_year) else 'comparative')
+
+        for ordinal, item in enumerate(parsed_rows):
+            label = f"Adjusted Segment EBITDA - {item['member']}"
+            candidates.append({
+                'SourceLabel': item['raw_label'],
+                'RawSourceLabel': item['raw_label'],
+                'Label': label,
+                'Value': float(item['value']),
+                'RawValue': item['raw_value'],
+                'DisplayDecimals': _gb_display_decimal_places(
+                    item['raw_value']),
+                'Scale': float(scale),
+                'UnitKind': 'money',
+                'UnitConfidence': 0.995,
+                'UnitEvidence': 'adjusted-segment-ebitda-period-table',
+                'Prefix': 'Adjusted Segment EBITDA',
+                'Confidence': 0.999,
+                'PeriodBasis': _GB_BASIS_DURATION_FLOW,
+                'BasisConfidence': 0.999,
+                'TableRole': _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE,
+                'TableGeometry': 'member_rows_explicit_period_columns',
+                'AnalyticalBasis': 'reportable_segment_pnl',
+                'Category': '4a_Segments_Business',
+                'SemanticType': 'Adjusted Segment EBITDA',
+                'AdmissionRule': 'adjusted_segment_ebitda_atomic_family',
+                'MetricFamily': 'adjusted_segment_ebitda',
+                'MetricIdentity': 'adjusted segment ebitda',
+                'Duration': int(duration),
+                'ValueHeader': header,
+                'PeriodRole': period_role,
+                'AtomicSegmentEBITDAFamily': True,
+                'ContextualDashZero': bool(item['dash_zero']),
+                'SourceRowOrdinal': int(pos * 100 + ordinal),
+            })
+    return candidates
 
 
 def _extract_generic_business_breakdown_from_table(
@@ -8657,6 +9775,90 @@ def _extract_generic_business_breakdown_from_table(
     return candidates if len(candidates) >= 2 else []
 
 
+def _gb_unit_context_from_text(text) -> str:
+    """Return only rendered scale/unit phrases from broader HTML text."""
+    corpus = _gb_clean_text(text)
+    matches = []
+    for match in re.finditer(
+            r'(?:(?:amounts?|dollars?|usd|u\.?s\.? dollars?)\s+)?'
+            r'(?:are\s+)?(?:stated\s+)?(?:in\s+)?'
+            r'(?:billions?|millions?|thousands?)',
+            corpus, re.I):
+        phrase = _gb_clean_text(match.group(0))
+        if phrase and phrase.casefold() not in {item.casefold() for item in matches}:
+            matches.append(phrase)
+        if len(matches) >= 3:
+            break
+    return ' | '.join(matches)
+
+
+def _gb_immediate_table_context(table_tag, max_chars: int = 900) -> str:
+    """Return only the caption and immediately governing DOM text.
+
+    This intentionally stops at a preceding table.  It is suitable for metric
+    classification, unlike the broader section context used for discovery.
+    """
+    pieces = []
+    total = 0
+    try:
+        caption = table_tag.find('caption')
+    except Exception:
+        caption = None
+    if caption is not None:
+        text = _gb_clean_text(caption.get_text(' ', strip=True))
+        if text:
+            pieces.append(text)
+            total += len(text)
+
+    try:
+        siblings = table_tag.previous_siblings
+    except Exception:
+        siblings = ()
+    inspected = 0
+    for sibling in siblings:
+        inspected += 1
+        if inspected > 20 or total >= max_chars:
+            break
+        if getattr(sibling, 'name', None) == 'table':
+            break
+        try:
+            text = _gb_clean_text(
+                sibling.get_text(' ', strip=True)
+                if hasattr(sibling, 'get_text') else sibling)
+        except Exception:
+            text = ''
+        if not text or len(text) > 650:
+            continue
+        pieces.insert(0, text)
+        total += len(text)
+        if re.search(
+                r'\b(?:three|six|nine|twelve)\s+months?\s+ended\b|'
+                r'\byear\s+ended\b|\bsegment\s+adjusted\s+ebitda\b',
+                text, re.I):
+            if len(pieces) >= 2:
+                break
+
+    if not pieces:
+        try:
+            parent = table_tag.parent
+        except Exception:
+            parent = None
+        if parent is not None:
+            try:
+                for node in parent.find_all(
+                        ['h1','h2','h3','h4','h5','h6','strong','b','p'],
+                        recursive=False, limit=6):
+                    text = _gb_clean_text(node.get_text(' ', strip=True))
+                    if text and len(text) <= 650:
+                        pieces.append(text)
+                        total += len(text)
+                        if total >= max_chars:
+                            break
+            except Exception:
+                pass
+    return _gb_clean_text(' | '.join(pieces))[:max_chars]
+
+
 def _gb_nearby_table_context(table_tag, max_chars: int = 2400) -> str:
     """Collect the table's DOM section context, including its governing heading.
 
@@ -8881,11 +10083,24 @@ def _extract_generic_business_breakdowns_from_textblocks(
             candidate_end_text = effective_end_dt.strftime('%Y-%m-%d')
             label_key = re.sub(r'\s+', ' ', candidate['Label']).strip().casefold()
             fact_key = (label_key, candidate_fy, candidate_q)
-            if ((fact_key in existing_keys
-                 and _gb_existing_fact_blocks_html_candidate(
-                     existing_by_key.get(fact_key, ()), candidate))
-                    or fact_key in accepted_keys):
+            is_atomic_ebitda = bool(
+                candidate.get('AtomicSegmentEBITDAFamily'))
+            if (
+                fact_key in existing_keys
+                and not is_atomic_ebitda
+                and _gb_existing_fact_blocks_html_candidate(
+                    existing_by_key.get(fact_key, ()), candidate)
+            ):
                 continue
+            if fact_key in accepted_keys:
+                if not is_atomic_ebitda:
+                    continue
+                # Replace only a weaker HTML candidate for the same label and
+                # period; the family has already passed full reconciliation.
+                accepted[:] = [row for row in accepted if not (
+                    re.sub(r'\s+',' ',str(row.get('Label') or '')).strip().casefold()==label_key
+                    and row.get('FY')==candidate_fy and row.get('Q')==candidate_q)]
+                accepted_keys.discard(fact_key)
             duration = _gb_resolve_candidate_duration(
                 candidate, preferred_duration)
             start_dt = (effective_end_dt if duration == 0
@@ -8912,7 +10127,8 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'Start': start_dt.strftime('%Y-%m-%d'),
                 'Duration': duration,
                 'Filed': filed,
-                'TagRank': (0 if candidate.get('AtomicOperatingTable') else 998),
+                'TagRank': (-5 if candidate.get('AtomicSegmentEBITDAFamily')
+                            else (0 if candidate.get('AtomicOperatingTable') else 998)),
                 'DimCount': 0,
                 'IsCalculated': False,
                 'Concept': 'HTMLBusinessBreakdown',
@@ -8939,9 +10155,11 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 ),
                 'SourceMetricFamily': candidate.get('MetricFamily'),
                 'SourceMetricIdentity': candidate.get('MetricIdentity'),
-                'SourceKind': ('html_atomic_operating_group'
+                'SourceKind': ('html_atomic_segment_ebitda'
+                               if candidate.get('AtomicSegmentEBITDAFamily')
+                               else ('html_atomic_operating_group'
                                if candidate.get('AtomicOperatingTable')
-                               else 'html_table'),
+                               else 'html_table')),
                 'SourceAdmissionRule': candidate.get('AdmissionRule'),
                 'SourceAtomicOperatingTable': bool(
                     candidate.get('AtomicOperatingTable')),
@@ -8961,7 +10179,8 @@ def _extract_generic_business_breakdowns_from_textblocks(
             })
             accepted_keys.add(fact_key)
 
-    def _accept_table(table, context):
+    def _accept_table(
+            table, context, metric_context=None, unit_context=None):
         table_fingerprint = _gb_table_fingerprint(table)
         current_fy, current_q = get_period_info(end_dt, ye_month)
         current_reference = _gb_reference_magnitude_from_facts(
@@ -8972,10 +10191,24 @@ def _extract_generic_business_breakdowns_from_textblocks(
         # rows and reportable segments are columns.  Parse that layout first; the
         # ordinary period-column parser below remains authoritative for standard
         # tables and operating highlights.
-        columnar_candidates = _extract_columnar_segment_breakdown_from_table(
-            table, context, current_year,
+        local_metric_context = _gb_clean_text(
+            f"{metric_context or ''} {unit_context or ''}")
+        ebitda_candidates = _gb_extract_adjusted_segment_ebitda_period_table(
+            table, local_metric_context, current_year,
             preferred_duration=preferred_duration,
             reference_magnitude=current_reference)
+        if ebitda_candidates:
+            _accept_candidates(
+                ebitda_candidates, end_dt, 'current',
+                table_fingerprint, geographic_basis)
+
+        columnar_context = _gb_clean_text(
+            f"{context or ''} {unit_context or ''}")
+        columnar_candidates = _extract_columnar_segment_breakdown_from_table(
+            table, columnar_context, current_year,
+            preferred_duration=preferred_duration,
+            reference_magnitude=current_reference,
+            explicit_value_header=metric_context)
         if columnar_candidates:
             columnar_end = _gb_nearest_explicit_period_end(context, end_dt)
             columnar_role = (
@@ -9020,10 +10253,13 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 comparative_candidates, comparative_end_dt, 'comparative',
                 table_fingerprint, geographic_basis)
 
-    def _accept_table_safely(table, context):
+    def _accept_table_safely(
+            table, context, metric_context=None, unit_context=None):
         """Isolate malformed SEC tables so later valid tables still parse."""
         try:
-            _accept_table(table, context)
+            _accept_table(
+                table, context, metric_context=metric_context,
+                unit_context=unit_context)
             return True
         except Exception as table_error:
             _debug_print(
@@ -9205,7 +10441,11 @@ def _extract_generic_business_breakdowns_from_textblocks(
             continue
         # Cheap source-level gate before BeautifulSoup/pandas work.
         plain_preview = _gb_clean_text(re.sub(r'<[^>]+>', ' ', html_lib.unescape(html_text)))
-        if not _gb_has_positive_context(plain_preview):
+        if (
+            not _gb_has_positive_context(plain_preview)
+            and not re.search(r'\bsegment\s+adjusted\s+ebitda\b',
+                              plain_preview, re.I)
+        ):
             continue
         try:
             soup = BeautifulSoup(html_text, 'html.parser')
@@ -9221,14 +10461,17 @@ def _extract_generic_business_breakdowns_from_textblocks(
             if table_tag.find('table') is not None:
                 continue
             context = _gb_nearby_table_context(table_tag)
-            if not context:
-                context = plain_preview[:1800]
+            metric_context = _gb_immediate_table_context(table_tag)
+            unit_context = _gb_unit_context_from_text(
+                f"{metric_context} {plain_preview}")
             try:
                 parsed_tables = pd.read_html(StringIO(str(table_tag)))
             except Exception:
                 continue
             for table in parsed_tables[:1]:
-                _accept_table_safely(table, context)
+                _accept_table_safely(
+                    table, context, metric_context=metric_context,
+                    unit_context=unit_context)
 
     # Inline-XBRL presentation tables can live directly in the filing HTML
     # without being wrapped by an XBRL TextBlock fact.  Scan only tables whose
@@ -9244,14 +10487,24 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 if table_tag.find('table') is not None:
                     continue
                 context = _gb_nearby_table_context(table_tag)
-                if not _gb_has_positive_context(context):
+                metric_context = _gb_immediate_table_context(table_tag)
+                unit_context = _gb_unit_context_from_text(
+                    f"{metric_context} {context}")
+                if (
+                    not _gb_has_positive_context(context)
+                    and not re.search(
+                        r'\bsegment\s+adjusted\s+ebitda\b',
+                        metric_context, re.I)
+                ):
                     continue
                 try:
                     parsed_tables = pd.read_html(StringIO(str(table_tag)))
                 except Exception:
                     continue
                 for table in parsed_tables[:1]:
-                    _accept_table_safely(table, context)
+                    _accept_table_safely(
+                        table, context, metric_context=metric_context,
+                        unit_context=unit_context)
         except Exception as filing_html_error:
             _debug_print(
                 f"  [Business Table] Full filing HTML scan skipped "
@@ -9260,6 +10513,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
     if accepted:
         print(f"  [Business Table] Recovered {len(accepted)} source-bound business breakdown fact(s) from filing HTML tables.")
     return accepted
+
 
 
 def _gb_fact_period_key(fact):
@@ -17262,7 +18516,18 @@ def _gb_restore_direct_discrete_q4_facts(
             # components.  Its authoritative Q4 is resolved by the dedicated
             # non-operating face-line hierarchy gate below.
             continue
-        if not _is_derived(selected):
+        selected_is_derived = _is_derived(selected)
+        selected_precision = _precision_scale(selected)
+        selected_is_direct = bool(
+            _text(selected.get('SourceDirectness')).casefold() == 'reported'
+            and not selected_is_derived
+        )
+        # Direct facts are normally protected.  The sole exception is a
+        # rounding-only precision upgrade: an older table reported in thousands
+        # can supersede a later comparative table rounded to millions when both
+        # are otherwise compatible and differ by no more than one displayed
+        # unit of the lower-precision source.
+        if not selected_is_derived and not selected_is_direct:
             continue
         fiscal_year = _number(selected.get('FY'))
         if pd.isna(fiscal_year):
@@ -17289,6 +18554,15 @@ def _gb_restore_direct_discrete_q4_facts(
         candidates['_GBPrecisionScale'] = candidates.apply(
             _precision_scale, axis=1)
         best_scale = candidates['_GBPrecisionScale'].min()
+        if (
+            selected_is_direct
+            and (
+                not np.isfinite(selected_precision)
+                or not np.isfinite(best_scale)
+                or float(best_scale) >= float(selected_precision)
+            )
+        ):
+            continue
         best = candidates[
             candidates['_GBPrecisionScale'].eq(best_scale)
         ].copy()
@@ -17312,6 +18586,14 @@ def _gb_restore_direct_discrete_q4_facts(
         ).iloc[0]
         old_value = _number(selected.get('Value'))
         new_value = float(candidate['_GBValue'])
+        if selected_is_direct and pd.notna(old_value):
+            rounding_tolerance = max(
+                1.0,
+                float(selected_precision),
+                0.002 * max(abs(float(old_value)), abs(new_value), 1.0),
+            )
+            if abs(float(old_value) - new_value) > rounding_tolerance:
+                continue
         if (
             pd.notna(old_value)
             and abs(float(old_value) - new_value)
@@ -17343,8 +18625,10 @@ def _gb_restore_direct_discrete_q4_facts(
                 replacement.get('SourceAdmissionRule'))
             out.at[row_index, 'SourceAdmissionRule'] = (
                 existing_rule or 'direct_discrete_q4_precedence')
+        repair_kind = (
+            'precision' if selected_is_direct else 'derived-precedence')
         repaired.append(
-            f"{selected.get('Label')} FY{fiscal_year}: "
+            f"{selected.get('Label')} FY{fiscal_year} [{repair_kind}]: "
             f"{old_value:,.0f} -> {new_value:,.0f}"
         )
 
@@ -30849,7 +32133,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-20.native-extraction.v23-inline-assets-atomic-om"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-21.native-extraction.v28-stable-filing-owner-date-range-ex99"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -31019,7 +32303,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v57-direct-q4-period-block-nonoperating-face"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v62-isolated-enrichment-table-local"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -31035,7 +32319,8 @@ _FINAL_PIVOT_CACHE_LOCK = threading.RLock()
 
 def _final_pivot_cache_key(ticker, company, mode, limit, ye_month, use_arelle,
                            filings, company_name=None, is_financial=False,
-                           is_insurance=False, is_oil_gas=False, is_reit=False):
+                           is_insurance=False, is_oil_gas=False, is_reit=False,
+                           supplement_manifest=None):
     if not _FINAL_PIVOT_CACHE_ENABLED:
         return None
     filing_ids = []
@@ -31067,6 +32352,8 @@ def _final_pivot_cache_key(ticker, company, mode, limit, ye_month, use_arelle,
         "pandas": getattr(pd, "__version__", ""),
         "numpy": getattr(np, "__version__", ""),
         "filings": tuple(filing_ids),
+        "supplement_manifest": _fx_freeze_for_cache(
+            supplement_manifest or {}),
     }
     return _fx_freeze_for_cache(key)
 
@@ -31928,7 +33215,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         progress.finish("Complete" if result is not None else "Complete (no data)")
         if not log_output:
             builtins.print = _original_print
-        return
+        return result
 
     # --- Native U.S. 10-K annual mode: isolated 10-K / 10-K/A FY branch ---
     if annual:
@@ -31953,11 +33240,12 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         else:
             progress.finish("Complete" if out_path else "Complete (no data)")
             _original_print(f"Success! Data saved to {out_path}" if out_path else "No data extracted.")
-        return
+        return out_path
 
     progress.set(6.0, "Listing SEC filings")
     with _ExternalConsoleSilencer(enabled=not log_output):
         filings = list(fetch_filings(company, limit))
+    earnings_release_filings = []
     progress.set(8.0, f"Queued {len(filings)} SEC filings")
     progress.set_stats(0, len(filings), f"Queued {len(filings)} SEC filings")
 
@@ -31996,8 +33284,11 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         worker_label += f" ({requested_workers} requested)"
 
     extraction_cache_key = _native_extraction_cache_key(
-        ticker, company, profile.pipeline, limit, ye_month, use_arelle, filings
+        ticker, company, profile.pipeline, limit, ye_month, use_arelle,
+        list(filings)
     )
+    _cached_extraction_metadata = {}
+    _q4_supplement_manifest = {}
 
     card_width = progress.sync_terminal_width()
     _status_print(_format_run_card(
@@ -32019,6 +33310,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
     cached_extraction = _native_extraction_cache_get(extraction_cache_key)
     if cached_extraction is not _NATIVE_EXTRACTION_CACHE_MISS:
         _restore_cached_native_extraction(cached_extraction, all_facts, period_dates)
+        _cached_extraction_metadata = dict(
+            cached_extraction.get('metadata') or {})
         progress.set_stats(len(filings), len(filings), "Loaded native extraction cache")
         progress.set(70.0, "Loaded cached SEC extraction")
         print(f"  [Cache] Loaded native extraction cache for {ticker.upper()} "
@@ -32155,31 +33448,145 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                               f"metadata for {filing_id}.")
 
 
-        if all_facts and not failed_filings:
-            _native_extraction_cache_set(
-                extraction_cache_key,
-                all_facts,
-                period_dates,
-                _snapshot_native_mutable_state(),
-                metadata={
-                    "ticker": str(ticker).upper(),
-                    "mode": str(profile.pipeline or "US_NATIVE"),
-                    "filings": len(filings),
-                    "facts": len(all_facts),
-                },
-            )
-
+    # Canonicalize business facts before discovering supplement years. Raw
+    # issuer labels are not a reliable routing key for historical EX-99 search.
     if all_facts:
         all_facts[:] = _reconcile_html_business_breakdown_facts(all_facts)
+
+    # Discover historical supplement years only after base facts expose all
+    # comparative fiscal years represented in the extraction.
+    _q4_target_years = _gb_q4_earnings_release_target_years_from_facts(
+        all_facts, is_financial=is_financial)
+    _cached_completed_years = {
+        int(year) for year in (
+            _cached_extraction_metadata.get(
+                'q4_supplement_target_years') or ())
+    }
+    _required_q4_target_years = (
+        set(_q4_target_years) | _cached_completed_years
+    )
+    _missing_q4_target_years = (
+        set(_q4_target_years) - _cached_completed_years
+    )
+    _earnings_release_q4_facts = []
+    _q4_supplement_diagnostics = {
+        'filings': 0, 'attachments': 0, 'facts': 0, 'years': (),
+    }
+
+    if all_facts and _missing_q4_target_years:
+        with _ExternalConsoleSilencer(enabled=not log_output):
+            earnings_release_filings = list(
+                _gb_relevant_earnings_release_filings(
+                    company,
+                    limit=limit,
+                    ye_month=ye_month,
+                    target_years=_missing_q4_target_years,
+                )
+            )
+            _earnings_release_q4_facts = (
+                _gb_extract_direct_q4_facts_from_earnings_release_filings(
+                    earnings_release_filings,
+                    _missing_q4_target_years,
+                    ye_month,
+                    is_financial=is_financial,
+                    diagnostics=_q4_supplement_diagnostics,
+                )
+            )
+        if _earnings_release_q4_facts:
+            _existing_supplement_keys = {
+                (
+                    fact.get('Category'), fact.get('Label'),
+                    fact.get('FY'), fact.get('Q'), fact.get('Value'),
+                    fact.get('Accession'), fact.get('Concept'),
+                )
+                for fact in all_facts
+            }
+            for _fact in _earnings_release_q4_facts:
+                _key = (
+                    _fact.get('Category'), _fact.get('Label'),
+                    _fact.get('FY'), _fact.get('Q'), _fact.get('Value'),
+                    _fact.get('Accession'), _fact.get('Concept'),
+                )
+                if _key in _existing_supplement_keys:
+                    continue
+                all_facts.append(_fact)
+                _existing_supplement_keys.add(_key)
+
+    if _q4_target_years:
+        _original_print(
+            "  [Q4 Supplement] Suspect fiscal years: "
+            + ", ".join(str(year) for year in sorted(_q4_target_years)))
+        if _missing_q4_target_years:
+            _original_print(
+                f"  [Q4 Supplement] Matching 8-K filings: "
+                f"{_q4_supplement_diagnostics.get('filings', 0)}")
+            _original_print(
+                f"  [Q4 Supplement] EX-99 attachments parsed: "
+                f"{_q4_supplement_diagnostics.get('attachments', 0)}")
+            _original_print(
+                f"  [Q4 Supplement] Direct facts admitted: "
+                f"{_q4_supplement_diagnostics.get('facts', 0)}")
+
+    _admitted_q4_target_years = {
+        int(float(fact.get('FY')))
+        for fact in _earnings_release_q4_facts
+        if fact.get('FY') is not None
+    }
+    _completed_q4_target_years = (
+        _cached_completed_years | _admitted_q4_target_years
+    )
+    _q4_supplement_manifest = _gb_earnings_release_supplement_manifest(
+        _completed_q4_target_years,
+        earnings_release_filings,
+        _earnings_release_q4_facts,
+    )
+    _q4_supplement_manifest['required_target_years'] = tuple(
+        sorted(int(year) for year in _required_q4_target_years))
+    _q4_supplement_manifest['completed_target_years'] = tuple(
+        sorted(_completed_q4_target_years))
+    _q4_supplement_manifest['complete'] = bool(
+        set(_required_q4_target_years).issubset(
+            _completed_q4_target_years))
+    if not earnings_release_filings:
+        _cached_manifest = _cached_extraction_metadata.get(
+            'q4_supplement_manifest')
+        if isinstance(_cached_manifest, dict):
+            _q4_supplement_manifest = dict(_cached_manifest)
+            _q4_supplement_manifest['required_target_years'] = tuple(
+                sorted(int(year) for year in _required_q4_target_years))
+            _q4_supplement_manifest['completed_target_years'] = tuple(
+                sorted(_completed_q4_target_years))
+            _q4_supplement_manifest['complete'] = bool(
+                set(_required_q4_target_years).issubset(
+                    _completed_q4_target_years))
+
+    if all_facts and not failed_filings:
+        _native_extraction_cache_set(
+            extraction_cache_key,
+            all_facts,
+            period_dates,
+            _snapshot_native_mutable_state(),
+            metadata={
+                "ticker": str(ticker).upper(),
+                "mode": str(profile.pipeline or "US_NATIVE"),
+                "filings": len(filings),
+                "facts": len(all_facts),
+                "q4_supplement_target_years": tuple(
+                    sorted(_completed_q4_target_years)),
+                "q4_supplement_manifest": _q4_supplement_manifest,
+            },
+        )
 
     progress.set(70.0, "SEC retrieval complete")
 
     # -- Final processing & output --------------------------------------------
     if all_facts:
         final_cache_key = _final_pivot_cache_key(
-            ticker, company, f"{profile.pipeline}_FINAL", limit, ye_month, use_arelle, filings,
+            ticker, company, f"{profile.pipeline}_FINAL", limit, ye_month,
+            use_arelle, list(filings),
             company_name=_company_name, is_financial=is_financial, is_insurance=is_insurance,
             is_oil_gas=is_oil_gas, is_reit=is_reit,
+            supplement_manifest=_q4_supplement_manifest,
         )
         cached_final = _final_pivot_cache_get(final_cache_key)
         if cached_final is not _FINAL_PIVOT_CACHE_MISS:
@@ -32727,6 +34134,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         else:
             progress.finish("Complete")
             _original_print(f"Success! Data saved to {out_path}")
+        return out_path
     else:
         if not log_output:
             progress.finish("Complete (no data)", "No data extracted.")
@@ -32734,12 +34142,249 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         else:
             progress.finish("Complete (no data)")
             _original_print("No data extracted.")
+        return None
+
+
+def _normalize_ticker_queue(tickers):
+    """Normalize CLI ticker tokens while preserving the requested order."""
+    normalized = []
+    for token in tickers or ():
+        # Accept the documented space-separated form and tolerate commas in a
+        # pasted list without changing the order.
+        for part in str(token).split(','):
+            ticker = part.strip().upper()
+            if not ticker:
+                continue
+            if not re.fullmatch(r'[A-Z0-9][A-Z0-9.\-]{0,14}', ticker):
+                raise ValueError(
+                    f"Invalid ticker '{part}'. Use symbols such as AMZN, "
+                    "GOOGL, BRK.B, or RDS-A."
+                )
+            normalized.append(ticker)
+    if not normalized:
+        raise ValueError("At least one ticker is required.")
+    return normalized
+
+
+def _queue_child_command(
+        ticker, limit, use_arelle=False, log_output=False,
+        save_xlsx=False, workers=None, annual=False,
+        result_file=None):
+    """Build the one-ticker child command used by the parent queue."""
+    command = [
+        sys.executable,
+        os.path.abspath(__file__),
+        '--ticker', str(ticker),
+        '--limit', str(int(limit)),
+        '--queue-child',
+    ]
+    if result_file:
+        command.extend(['--queue-result-file', str(result_file)])
+    if not use_arelle:
+        command.append('--no-arelle')
+    if log_output:
+        command.append('--log')
+    if save_xlsx:
+        command.append('--xlsx')
+    if workers is not None:
+        command.extend(['--workers', str(int(workers))])
+    if annual:
+        command.append('--annual')
+    return command
+
+
+def _write_queue_child_result(path, payload):
+    if not path:
+        return
+    destination = os.path.abspath(str(path))
+    parent = os.path.dirname(destination)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temporary = destination + f'.tmp.{os.getpid()}'
+    with open(temporary, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    os.replace(temporary, destination)
+
+
+def run_ticker_queue(
+        tickers, limit, use_arelle=False, dqc_ruleset=None,
+        log_output=False, save_xlsx=False, workers=None, annual=False,
+        stop_on_error=False):
+    """Run ticker jobs serially with one fresh Python process per company.
+
+    The parent waits for each child to exit and save its output before launching
+    the next ticker.  This restores the isolation property of the historical
+    single-ticker CLI and prevents process-global filing, parser, and concept
+    caches from crossing company boundaries.
+    """
+    import subprocess
+    import tempfile
+    import time
+
+    queue = _normalize_ticker_queue(tickers)
+    total = len(queue)
+    results = []
+
+    if total == 1:
+        ticker = queue[0]
+        started_at = time.monotonic()
+        try:
+            output_path = main(
+                ticker, limit,
+                use_arelle=use_arelle,
+                dqc_ruleset=dqc_ruleset,
+                log_output=log_output,
+                save_xlsx=save_xlsx,
+                workers=workers,
+                annual=annual,
+            )
+            return [{
+                'ticker': ticker,
+                'status': 'saved' if output_path else 'no_data',
+                'output_path': output_path,
+                'elapsed_seconds': time.monotonic() - started_at,
+                'error': None,
+            }]
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            return [{
+                'ticker': ticker,
+                'status': 'failed',
+                'output_path': None,
+                'elapsed_seconds': time.monotonic() - started_at,
+                'error': f'{type(exc).__name__}: {exc}',
+            }]
+
+    print(
+        f"[Queue] {total} isolated ticker jobs will run sequentially: "
+        + ' -> '.join(queue)
+    )
+
+    for position, ticker in enumerate(queue, start=1):
+        started_at = time.monotonic()
+        result_path = None
+        payload = None
+        print(f"\n[Queue {position}/{total}] Starting {ticker}")
+        try:
+            file_handle = tempfile.NamedTemporaryFile(
+                prefix=f'sec_data_queue_{ticker}_',
+                suffix='.json',
+                delete=False,
+            )
+            result_path = file_handle.name
+            file_handle.close()
+            try:
+                os.unlink(result_path)
+            except FileNotFoundError:
+                pass
+
+            command = _queue_child_command(
+                ticker,
+                limit,
+                use_arelle=use_arelle,
+                log_output=log_output,
+                save_xlsx=save_xlsx,
+                workers=workers,
+                annual=annual,
+                result_file=result_path,
+            )
+            completed = subprocess.run(command, check=False)
+            if result_path and os.path.exists(result_path):
+                try:
+                    with open(result_path, 'r', encoding='utf-8') as handle:
+                        payload = json.load(handle)
+                except Exception:
+                    payload = None
+            if payload is None:
+                payload = {
+                    'ticker': ticker,
+                    'status': 'failed' if completed.returncode else 'no_data',
+                    'output_path': None,
+                    'error': (
+                        f'Child process exited with code {completed.returncode}'
+                        if completed.returncode else None
+                    ),
+                }
+            elif completed.returncode and payload.get('status') != 'failed':
+                payload['status'] = 'failed'
+                payload['error'] = (
+                    payload.get('error')
+                    or f'Child process exited with code {completed.returncode}'
+                )
+        except KeyboardInterrupt:
+            print(f"\n[Queue {position}/{total}] Interrupted during {ticker}.")
+            raise
+        except Exception as exc:
+            payload = {
+                'ticker': ticker,
+                'status': 'failed',
+                'output_path': None,
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+        finally:
+            if result_path:
+                try:
+                    os.unlink(result_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+
+        payload['elapsed_seconds'] = time.monotonic() - started_at
+        payload.setdefault('ticker', ticker)
+        payload.setdefault('output_path', None)
+        payload.setdefault('error', None)
+        results.append(payload)
+
+        if payload.get('status') == 'failed':
+            print(
+                f"[Queue {position}/{total}] FAILED {ticker}: "
+                f"{payload.get('error') or 'unknown error'}"
+            )
+            if stop_on_error:
+                break
+        else:
+            print(
+                f"[Queue {position}/{total}] Finished {ticker}: "
+                f"{payload.get('output_path') or 'no output file'}"
+            )
+
+    saved = sum(result.get('status') == 'saved' for result in results)
+    no_data = sum(result.get('status') == 'no_data' for result in results)
+    failed = sum(result.get('status') == 'failed' for result in results)
+    print(
+        "\n[Queue] Complete — "
+        f"saved: {saved}, no data: {no_data}, failed: {failed}"
+    )
+    for result in results:
+        detail = (
+            result.get('output_path') or result.get('error') or 'no data')
+        print(
+            f"  {result.get('ticker')}: {result.get('status')} — {detail}"
+        )
+    return results
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ticker", required=True)
+    parser.add_argument(
+        "--ticker",
+        required=True,
+        nargs="+",
+        metavar="TICKER",
+        help=(
+            "One or more ticker symbols. Multiple symbols run as isolated "
+            "sequential child processes, for example: --ticker AMZN GOOGL UBER"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=50,
-                        help="Number of filings to pull (fewer = faster; less history).")
+                        help="Number of filings to pull per ticker (fewer = faster; less history).")
     parser.add_argument("--no-arelle", action="store_true",
                         help="Skip the slow Arelle custom-tag pre-pass "
                              "(10-K annual filings and 20-F/40-F annual enrichment).")
@@ -32747,16 +34392,72 @@ if __name__ == "__main__":
     parser.add_argument("--xlsx", action="store_true",
                         help="Save as .xlsx (one sheet per statement) instead of CSV.")
     parser.add_argument("--workers", type=int, default=None,
-                        help="Native 10-K/10-Q worker count. Defaults to "
-                             "SEC_MAX_WORKERS or 8; SEC request starts remain "
-                             "globally rate-limited.")
+                        help="Native 10-K/10-Q worker count used inside each isolated ticker process.")
     parser.add_argument("--annual", action="store_true",
                         help="For native 10-K filers, fetch 10-K/10-K/A annual filings only and output FY columns.")
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop the ticker queue immediately when one ticker fails. "
+             "By default, later tickers continue.",
+    )
     parser.add_argument("--reset-identity", action="store_true",
                         help="Delete the saved SEC contact identity and show first-run setup again.")
+    parser.add_argument("--queue-child", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--queue-result-file", default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.reset_identity:
         _reset_cached_sec_identity()
-    main(args.ticker.upper(), args.limit, use_arelle=not args.no_arelle,
-         log_output=args.log, save_xlsx=args.xlsx, workers=args.workers,
-         annual=args.annual)
+
+    if args.queue_child:
+        child_ticker = _normalize_ticker_queue(args.ticker)
+        if len(child_ticker) != 1:
+            parser.error("A queue child must receive exactly one ticker.")
+        ticker = child_ticker[0]
+        try:
+            output_path = main(
+                ticker,
+                args.limit,
+                use_arelle=not args.no_arelle,
+                log_output=args.log,
+                save_xlsx=args.xlsx,
+                workers=args.workers,
+                annual=args.annual,
+            )
+            child_payload = {
+                'ticker': ticker,
+                'status': 'saved' if output_path else 'no_data',
+                'output_path': output_path,
+                'error': None,
+            }
+            _write_queue_child_result(args.queue_result_file, child_payload)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            child_payload = {
+                'ticker': ticker,
+                'status': 'failed',
+                'output_path': None,
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+            _write_queue_child_result(args.queue_result_file, child_payload)
+            raise
+    else:
+        try:
+            queue_results = run_ticker_queue(
+                args.ticker,
+                args.limit,
+                use_arelle=not args.no_arelle,
+                log_output=args.log,
+                save_xlsx=args.xlsx,
+                workers=args.workers,
+                annual=args.annual,
+                stop_on_error=args.stop_on_error,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        if any(result["status"] == "failed" for result in queue_results):
+            raise SystemExit(1)
