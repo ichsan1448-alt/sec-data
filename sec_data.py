@@ -14096,6 +14096,43 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
     # lookup, then remove all scratch columns before downstream HTML checks.
     period_end_date = extract_period_end_date(filing, facts_df)
 
+    # Strict source-reported RPO narrative fallback.  This runs only when the
+    # filing produced no usable monetary RPO total through XBRL.  The helper
+    # requires one unambiguous monetary amount and an explicit as-of date that
+    # matches the filing period end, so timing buckets, percentages, deferred
+    # revenue, backlog, and duration disclosures are not promoted as totals.
+    try:
+        _rpo_concept_hint = bool(
+            facts_df['_concept_short'].fillna('').astype(str).str.startswith(
+                _RPO_CONCEPT_PREFIX).any())
+        _rpo_text_hint = False
+        if not _rpo_concept_hint and 'value' in facts_df.columns:
+            _rpo_text_rows = facts_df[
+                facts_df['_concept_short'].fillna('').astype(str).str.contains(
+                    'TextBlock|Disclosure|Policy', case=False, regex=True, na=False)
+            ].get('value', pd.Series(dtype=object))
+            if not _rpo_text_rows.empty:
+                _rpo_text_hint = bool(
+                    _rpo_text_rows.fillna('').astype(str).str.contains(
+                        'remaining performance obligation|commitments not yet recognized',
+                        case=False, regex=True, na=False).any())
+        _rpo_narrative_fact = _gb_extract_rpo_narrative_total_fact(
+            filing=filing,
+            filing_form=filing_form,
+            filing_date=_filing_date_raw,
+            period_end_date=period_end_date,
+            ye_month=ye_month,
+            existing_facts=extracted,
+            filing_url=_get_filing_url_once(),
+            source_hint=(_rpo_concept_hint or _rpo_text_hint),
+        )
+        if _rpo_narrative_fact is not None:
+            extracted.append(_rpo_narrative_fact)
+    except Exception as _rpo_narrative_error:
+        _debug_print(
+            f"  [RPO Narrative] Rescue skipped "
+            f"({type(_rpo_narrative_error).__name__}: {_rpo_narrative_error})")
+
     # Additive, low-priority rescue for coherent monetary business tables.
     # Existing XBRL facts are skipped explicitly and retain priority.
     try:
@@ -20172,6 +20209,11 @@ def _gb_materialize_atomic_segment_measure_q4_facts(
 def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     df = pd.DataFrame(all_facts)
     if df.empty: return pd.DataFrame()
+    # Capture RPO before numeric coercion and before operating-period/category
+    # gates.  Direct filing values can legitimately carry IsCalculated=True
+    # when their concept participates in a calculation linkbase; that metadata
+    # must not make the source value disappear from the public RPO series.
+    _rpo_source_ledger = _gb_build_rpo_source_ledger(df)
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     df = df.dropna(subset=['Value'])
     df = _gb_prepare_operating_measure_facts(df)
@@ -22313,6 +22355,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         f'{fy}-{quarter}' for fy, quarter in _source_periods)
     final_pivot.attrs['eligible_operating_source_periods'] = sorted(
         f'{fy}-{quarter}' for fy, quarter in _operating_source_periods)
+    final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
     final_pivot.attrs[_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR] = sorted(
         _incomplete_debt_component_periods)
     final_pivot.attrs[_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR] = list(
@@ -33591,6 +33634,20 @@ def _sort_final_output_pivot(final_pivot, is_financial=False, is_insurance=False
             return (CAT_ORDER.get(cat, 99), *_segment_business_sort_key(label, business_segment_context))
         if cat in SEG_CATS or cat == '7_Concentration_Risk':
             return (CAT_ORDER.get(cat, 99), seg_met_order.get(base, 999), label)
+        if cat == OPERATING_METRICS_CATEGORY:
+            if label == 'RPO - Total':
+                operating_rank = 0
+            elif label == 'RPO - Next 12 Months':
+                operating_rank = 1
+            elif label == 'RPO - Next 12 Months (%)':
+                operating_rank = 2
+            elif label.startswith('RPO - '):
+                operating_rank = 3
+            elif label.startswith('RPO Expected Recognition - '):
+                operating_rank = 4
+            else:
+                operating_rank = 10
+            return (CAT_ORDER.get(cat, 99), 1000 + operating_rank, label)
         if cat == '5_KPI_Metrics':
             return (CAT_ORDER.get(cat, 99), kpi_order.get(label, 999), label)
         if cat in ('2_Balance_Sheet', '3_Cash_Flow'):
@@ -33910,6 +33967,600 @@ def _hide_stale_operating_measure_rows(
     return result
 
 
+
+_RPO_CONCEPT_PREFIX = 'RevenueRemainingPerformanceObligation'
+_RPO_TIMING_AXIS_TOKEN = (
+    'RevenueRemainingPerformanceObligationExpectedTimingOfSatisfactionStartDateAxis'
+)
+_RPO_DURATION_CONCEPT_TOKEN = 'expectedtimingofsatisfactionperiod1'
+_RPO_OUTPUT_LABEL_RE = re.compile(r'^RPO(?:\s|$|-)', re.I)
+_RPO_DATE_MEMBER_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_RPO_DOMAIN_MEMBER_RE = re.compile(r'(?:\.domain|axis\.domain)$', re.I)
+_RPO_MONTH_NAME_RE = (
+    r'(?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)'
+)
+_RPO_AS_OF_DATE_RE = re.compile(
+    rf'\bas\s+of\s+({_RPO_MONTH_NAME_RE}\s+\d{{1,2}},\s+\d{{4}})',
+    re.I,
+)
+_RPO_MONEY_RE = re.compile(
+    r'(?<![\w])\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|'
+    r'[0-9]+(?:\.[0-9]+)?)\s*(million|billion)\b',
+    re.I,
+)
+_RPO_NARRATIVE_STRONG_PHRASES = (
+    'remaining performance obligation',
+    'remaining performance obligations',
+    'transaction price allocated to remaining performance obligations',
+    'commitments not yet recognized',
+    'revenue not yet recognized under noncancelable contracts',
+)
+_RPO_NARRATIVE_REJECT_PHRASES = (
+    'purchase commitments',
+    'lease commitments',
+    'capital commitments',
+    'weighted-average remaining life',
+    'weighted average remaining life',
+)
+
+
+def _gb_is_rpo_output_label(label) -> bool:
+    """Return True only for published RPO metrics, never ``Corporate`` rows."""
+    return bool(_RPO_OUTPUT_LABEL_RE.match(
+        re.sub(r'\s+', ' ', str(label or '')).strip()))
+
+
+def _gb_rpo_pipe_parts(value):
+    """Split audit axis/member signatures while preserving source order."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    return [
+        re.sub(r'\s+', ' ', part).strip()
+        for part in str(value).split('|')
+        if re.sub(r'\s+', ' ', part).strip()
+    ]
+
+
+def _gb_clean_rpo_member(value):
+    """Create a readable member caption without guessing its accounting role."""
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    if not text:
+        return ''
+    if _RPO_DOMAIN_MEMBER_RE.search(text):
+        return ''
+    text = re.sub(r'^\{[^}]+\}', '', text)
+    text = re.sub(r'^//[^}]+\}', '', text)
+    text = text.replace('_', ' ')
+    text = re.sub(r'\s+', ' ', text).strip(' -')
+    return text
+
+
+def _gb_rpo_period_from_row(row):
+    """Return the public quarter/FY column represented by one source row."""
+    explicit = str(row.get('Period') or '').strip()
+    if re.fullmatch(r'\d{4}-(?:Q[1-4]|FY)', explicit):
+        return explicit
+    try:
+        fy = int(float(row.get('FY')))
+    except (TypeError, ValueError, OverflowError):
+        return ''
+    quarter = str(row.get('Q') or '').strip().upper()
+    if quarter in {'Q1', 'Q2', 'Q3', 'Q4'}:
+        return f'{fy}-{quarter}'
+    if quarter in {'FY', 'ANNUAL'}:
+        return f'{fy}-FY'
+    return ''
+
+
+def _gb_rpo_text(value) -> str:
+    """Normalize optional provenance text without turning NaN into 'nan'."""
+    try:
+        if value is None or pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().casefold()
+
+
+def _gb_rpo_value_is_derived(row) -> bool:
+    """Separate value derivation from calculation-linkbase participation.
+
+    EdgarTools can mark a directly filed fact ``IsCalculated=True`` merely
+    because its concept participates in a calculation relationship.  A value is
+    treated as derived only when explicit provenance says the numeric amount was
+    calculated, reconstructed, or synthesized.
+    """
+    source_kind = _gb_rpo_text(row.get('SourceKind'))
+    directness = _gb_rpo_text(row.get('SourceDirectness'))
+    derivation = _gb_rpo_text(row.get('SourceDerivation'))
+    admission = _gb_rpo_text(row.get('SourceAdmissionRule'))
+    if derivation:
+        return True
+    if source_kind.startswith('derived') or source_kind in {
+            'synthetic', 'reconstructed', 'calculated'}:
+        return True
+    if directness in {'derived', 'synthetic', 'reconstructed', 'calculated'}:
+        return True
+    if admission.startswith('annual_minus_') or admission.startswith('derived_'):
+        return True
+    return False
+
+
+def _gb_rpo_value_kind(row) -> str:
+    """Classify one RPO concept as monetary, percentage, duration, or unknown."""
+    concept_key = str(row.get('Concept') or '').casefold()
+    raw_value = str(row.get('Value') if row.get('Value') is not None else '').strip()
+    unit_kind = str(row.get('SourceUnitKind') or '').casefold()
+    if _RPO_DURATION_CONCEPT_TOKEN in concept_key or re.fullmatch(
+            r'P(?=\d)[0-9YMDTWHMS.]+', raw_value, re.I):
+        return 'duration'
+    if 'percentage' in concept_key or unit_kind in {'percent', 'percentage', 'ratio'}:
+        return 'percentage'
+    numeric = pd.to_numeric(pd.Series([row.get('Value')]), errors='coerce').iloc[0]
+    if pd.notna(numeric):
+        return 'monetary'
+    return 'unknown'
+
+
+def _gb_build_rpo_source_ledger(source_df):
+    """Capture every RPO source fact before generic operating filters.
+
+    The returned ledger is intentionally independent of the selected fact audit.
+    It retains directly filed facts even when ``IsCalculated`` is true because
+    of calculation-linkbase classification, while explicitly derived numeric
+    values remain marked and excluded by the publication normalizer.
+    """
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return pd.DataFrame()
+    if 'Concept' not in source_df.columns:
+        return pd.DataFrame()
+    concepts = source_df['Concept'].fillna('').astype(str)
+    ledger = source_df.loc[concepts.str.startswith(_RPO_CONCEPT_PREFIX)].copy()
+    if ledger.empty:
+        return ledger
+    ledger['_RPOPeriod'] = ledger.apply(_gb_rpo_period_from_row, axis=1)
+    ledger['_RPOValueNumeric'] = pd.to_numeric(ledger.get('Value'), errors='coerce')
+    ledger['_RPOValueKind'] = ledger.apply(_gb_rpo_value_kind, axis=1)
+    ledger['_RPOIsValueDerived'] = ledger.apply(_gb_rpo_value_is_derived, axis=1)
+    ledger['_RPOIsCalcLinkbaseClassified'] = (
+        ledger.get('SourceDirectness', pd.Series('', index=ledger.index))
+        .fillna('').astype(str).str.casefold().eq('calculation_linkbase')
+        | ledger.get('IsCalculated', pd.Series(False, index=ledger.index))
+        .fillna(False).astype(bool)
+    )
+    # Preserve a compact, stable set of fields in dataframe attrs/cache rather
+    # than carrying arbitrary parser scratch columns into every final pivot.
+    keep = [column for column in (
+        'Category', 'Label', 'Value', 'FY', 'Q', 'End', 'Start', 'Duration',
+        'Filed', 'TagRank', 'DimCount', 'IsCalculated', 'Concept', 'SourceKind',
+        'SourceAdmissionRule', 'SourceDirectness', 'SourceDerivation',
+        'SourceSemanticVerified', 'SourceTrustScore', 'SourceAxisSignature',
+        'SourceMemberSignature', 'SourceDimensionAxes', 'SourceDimensionMembers',
+        'SourceUnitKind', 'SourceUnitScale', 'Form', 'Accession', 'FilingUrl',
+        'SourceNarrativeHash', 'SourceNarrativeExcerpt', '_RPOPeriod',
+        '_RPOValueNumeric', '_RPOValueKind', '_RPOIsValueDerived',
+        '_RPOIsCalcLinkbaseClassified',
+    ) if column in ledger.columns]
+    return ledger[keep].reset_index(drop=True)
+
+
+def _gb_rpo_sentence_candidates(html_content):
+    """Yield compact filing sentences/blocks likely to contain an RPO total."""
+    soup = BeautifulSoup(str(html_content or ''), 'html.parser')
+    seen = set()
+    for tag in soup.find_all(['p', 'li', 'td', 'div']):
+        text = re.sub(r'\s+', ' ', tag.get_text(' ', strip=True)).strip()
+        if not 35 <= len(text) <= 2200:
+            continue
+        lower = text.casefold()
+        if not any(phrase in lower for phrase in _RPO_NARRATIVE_STRONG_PHRASES):
+            continue
+        # Prefer individual sentences, but retain the complete compact block
+        # because inline-XBRL tags sometimes interrupt sentence punctuation.
+        parts = re.split(r'(?<=[.;!?])\s+(?=[A-Z])', text)
+        for candidate in [*parts, text]:
+            candidate = re.sub(r'\s+', ' ', candidate).strip()
+            key = candidate.casefold()
+            if key and key not in seen:
+                seen.add(key)
+                yield candidate
+
+
+def _gb_extract_rpo_narrative_total_fact(
+        filing, filing_form, filing_date, period_end_date, ye_month,
+        existing_facts, filing_url=None, source_hint=True):
+    """Recover one unambiguous source-reported monetary RPO total from prose.
+
+    This is a fail-closed fallback.  It runs only when no usable monetary base
+    RPO fact exists, requires an explicit period-end ``as of`` date, exactly one
+    monetary amount in the candidate sentence/block, and strong RPO wording.
+    """
+    period_end = pd.to_datetime(period_end_date, errors='coerce')
+    if pd.isna(period_end):
+        return None
+
+    existing_rpo_family = False
+    for fact in existing_facts or ():
+        if str(fact.get('Concept') or '').startswith(_RPO_CONCEPT_PREFIX):
+            existing_rpo_family = True
+        if str(fact.get('Concept') or '') != 'RevenueRemainingPerformanceObligation':
+            continue
+        if _gb_rpo_value_is_derived(fact):
+            continue
+        numeric = pd.to_numeric(pd.Series([fact.get('Value')]), errors='coerce').iloc[0]
+        if pd.notna(numeric):
+            return None
+
+    # Avoid an extra HTML fetch for the vast majority of issuers.  The fallback
+    # is attempted only when the filing's raw XBRL/text-block corpus already
+    # indicates an RPO disclosure family.
+    if not source_hint and not existing_rpo_family:
+        return None
+
+    html_content = fetch_html(filing)
+    accepted = []
+    for candidate in _gb_rpo_sentence_candidates(html_content):
+        lower = candidate.casefold()
+        if any(phrase in lower for phrase in _RPO_NARRATIVE_REJECT_PHRASES):
+            continue
+        if ('deferred revenue' in lower or 'unearned revenue' in lower
+                or re.search(r'\bbacklog\b', lower)):
+            # Related metrics are not RPO totals unless the sentence separately
+            # states an explicit RPO/commitments-not-recognized amount.  Reject
+            # mixed sentences to avoid selecting the wrong nearby number.
+            continue
+        date_matches = list(_RPO_AS_OF_DATE_RE.finditer(candidate))
+        if len(date_matches) != 1:
+            continue
+        disclosed_date = pd.to_datetime(date_matches[0].group(1), errors='coerce')
+        if pd.isna(disclosed_date) or disclosed_date.normalize() != period_end.normalize():
+            continue
+        money_matches = list(_RPO_MONEY_RE.finditer(candidate))
+        if len(money_matches) != 1:
+            continue
+        # Timing-bucket language describes a component, not the point-in-time
+        # total.  Keep only statements framed as an as-of total/unrecognized
+        # commitment balance.
+        if any(phrase in lower for phrase in (
+                'expected to recognize', 'will be recognized',
+                'during the next', 'over the next', 'thereafter')):
+            continue
+        if not any(phrase in lower for phrase in _RPO_NARRATIVE_STRONG_PHRASES):
+            continue
+        amount = float(money_matches[0].group(1).replace(',', ''))
+        scale_word = money_matches[0].group(2).casefold()
+        value = amount * (1_000_000_000.0 if scale_word == 'billion' else 1_000_000.0)
+        if not np.isfinite(value) or value <= 0:
+            continue
+        accepted.append((value, candidate))
+
+    if not accepted:
+        return None
+    unique_values = sorted({round(value, 2) for value, _ in accepted})
+    if len(unique_values) != 1:
+        return None
+    value = float(unique_values[0])
+    excerpt = min((text for val, text in accepted if round(val, 2) == value),
+                  key=len)
+    fy, quarter = get_period_info(period_end, ye_month, 0)
+    excerpt_hash = hashlib.sha256(excerpt.encode('utf-8', 'replace')).hexdigest()
+    print(
+        f"  [RPO Narrative] Recovered source-reported RPO total "
+        f"{value:,.0f} for {int(fy)}-{quarter}.")
+    return {
+        'Category': OPERATING_METRICS_CATEGORY,
+        'Label': 'RPO - Totals',
+        'Value': value,
+        'FY': int(fy),
+        'Q': str(quarter),
+        'End': period_end.strftime('%Y-%m-%d'),
+        'Start': None,
+        'Duration': 0,
+        'Filed': filing_date,
+        'TagRank': 980,
+        'DimCount': 0,
+        'IsCalculated': False,
+        'Concept': 'RevenueRemainingPerformanceObligation',
+        'SourceKind': 'html_narrative',
+        'SourceAdmissionRule': 'rpo_narrative_total',
+        'SourceDirectness': 'reported',
+        'SourceSemanticType': 'remaining_performance_obligation',
+        'SourceAnalyticalBasis': 'point_in_time_total',
+        'SourceClassificationConfidence': 0.96,
+        'SourceSemanticVerified': True,
+        'SourceTrustScore': 0.94,
+        'SourcePeriodRole': 'instant',
+        'SourceUnitKind': 'monetary',
+        'SourceUnitScale': 1.0,
+        'SourceNarrativeHash': excerpt_hash,
+        'SourceNarrativeExcerpt': excerpt[:500],
+        'Form': filing_form,
+        'FilingUrl': filing_url,
+    }
+
+
+def _gb_rpo_source_records(source, output_columns):
+    """Return source-backed RPO records from a raw ledger or selected audit."""
+    if not isinstance(source, pd.DataFrame) or source.empty:
+        return []
+    if 'Concept' not in source.columns:
+        return []
+    ledger = source.copy()
+    concepts = ledger['Concept'].fillna('').astype(str)
+    ledger = ledger[concepts.str.startswith(_RPO_CONCEPT_PREFIX)].copy()
+    if ledger.empty:
+        return []
+    if '_RPOPeriod' not in ledger.columns:
+        ledger['_RPOPeriod'] = ledger.apply(_gb_rpo_period_from_row, axis=1)
+    if '_RPOValueNumeric' not in ledger.columns:
+        ledger['_RPOValueNumeric'] = pd.to_numeric(ledger.get('Value'), errors='coerce')
+    if '_RPOValueKind' not in ledger.columns:
+        ledger['_RPOValueKind'] = ledger.apply(_gb_rpo_value_kind, axis=1)
+    if '_RPOIsValueDerived' not in ledger.columns:
+        ledger['_RPOIsValueDerived'] = ledger.apply(_gb_rpo_value_is_derived, axis=1)
+    output_set = {str(column) for column in output_columns}
+    ledger = ledger[
+        ledger['_RPOPeriod'].fillna('').astype(str).isin(output_set)
+        & ~ledger['_RPOIsValueDerived'].fillna(False).astype(bool)
+    ].copy()
+    if ledger.empty:
+        return []
+
+    records = []
+    for order, (_, row) in enumerate(ledger.iterrows()):
+        value_kind = str(row.get('_RPOValueKind') or '')
+        # Duration concepts (for example P3Y11M) describe weighted-average life,
+        # not an RPO dollar balance.  Preserve them in the source ledger but do
+        # not publish them as monetary RPO metrics.
+        if value_kind not in {'monetary', 'percentage'}:
+            continue
+        numeric_value = pd.to_numeric(
+            pd.Series([row.get('_RPOValueNumeric', row.get('Value'))]),
+            errors='coerce').iloc[0]
+        if pd.isna(numeric_value):
+            continue
+        axes = _gb_rpo_pipe_parts(
+            row.get('SourceAxisSignature') or row.get('SourceDimensionAxes'))
+        members = _gb_rpo_pipe_parts(
+            row.get('SourceMemberSignature') or row.get('SourceDimensionMembers'))
+        timing_members = []
+        other_members = []
+        has_domain_member = False
+        has_timing_axis = any(
+            _RPO_TIMING_AXIS_TOKEN.casefold() in str(axis).casefold()
+            for axis in axes)
+        for raw_member in members:
+            member = re.sub(r'\s+', ' ', str(raw_member or '')).strip()
+            if not member:
+                continue
+            if _RPO_DOMAIN_MEMBER_RE.search(member):
+                has_domain_member = True
+                continue
+            if _RPO_DATE_MEMBER_RE.fullmatch(member):
+                timing_members.append(member)
+                continue
+            cleaned = _gb_clean_rpo_member(member)
+            if cleaned and cleaned.casefold() not in {
+                    'total', 'totals', 'consolidated', 'all'}:
+                other_members.append(cleaned)
+            elif has_timing_axis:
+                has_domain_member = True
+        timing_members = list(dict.fromkeys(timing_members))
+        other_members = list(dict.fromkeys(other_members))
+        end_date = pd.to_datetime(row.get('End'), errors='coerce')
+        trust = pd.to_numeric(pd.Series([row.get('SourceTrustScore')]),
+                              errors='coerce').iloc[0]
+        if pd.isna(trust):
+            trust = 0.0
+        semantic_verified = bool(
+            row.get('SourceSemanticVerified') is True
+            or str(row.get('SourceSemanticVerified')).lower() == 'true')
+        directness = str(row.get('SourceDirectness') or '').casefold()
+        source_kind = str(row.get('SourceKind') or '').casefold()
+        filed = pd.to_datetime(row.get('Filed'), errors='coerce')
+        records.append({
+            'order': order,
+            'period': str(row['_RPOPeriod']),
+            'value': float(numeric_value),
+            'value_kind': value_kind,
+            'concept': str(row.get('Concept') or ''),
+            'timing_members': timing_members,
+            'other_members': other_members,
+            'has_domain_member': bool(has_domain_member),
+            'has_dimensions': bool(axes or members),
+            'end_date': end_date,
+            'trust': float(trust),
+            'semantic_verified': semantic_verified,
+            'directness': directness,
+            'source_kind': source_kind,
+            'filed': filed,
+            'source_label': str(row.get('Label') or ''),
+        })
+    return records
+
+
+def _gb_rpo_audit_records(fact_audit, output_columns):
+    """Backward-compatible wrapper for tests and audit-only artifacts."""
+    return _gb_rpo_source_records(fact_audit, output_columns)
+
+
+def _gb_normalize_rpo_operating_metrics(
+        final_pivot, fact_audit=None, rpo_source_ledger=None):
+    """Publish all source-backed RPO measures in Operating Metrics.
+
+    Source priority is the pre-filter RPO ledger captured from raw filing facts.
+    The selected fact audit is only a compatibility fallback.  This prevents
+    direct RPO values from disappearing because generic operating-period gates
+    misread calculation-linkbase participation as numeric derivation.
+    """
+    if (final_pivot is None or final_pivot.empty
+            or not isinstance(final_pivot.index, pd.MultiIndex)):
+        return final_pivot
+
+    attrs = dict(getattr(final_pivot, 'attrs', {}) or {})
+    # CSVs loaded with pandas' Arrow string backend reject later float row
+    # insertion.  The live pipeline is usually object/numeric already, but an
+    # explicit object copy keeps the output-boundary normalizer dtype-agnostic
+    # without changing any existing cell value.
+    out = final_pivot.copy().astype(object)
+    existing_rpo = [
+        idx for idx in out.index
+        if _gb_is_rpo_output_label(idx[1])
+    ]
+    existing_snapshot = out.loc[existing_rpo].copy() if existing_rpo else None
+    if existing_rpo:
+        out = out.drop(index=existing_rpo)
+
+    if rpo_source_ledger is None:
+        rpo_source_ledger = attrs.get('rpo_source_ledger')
+    if fact_audit is None:
+        fact_audit = attrs.get('fact_audit')
+    records = _gb_rpo_source_records(rpo_source_ledger, out.columns)
+    source_basis = 'pre_filter_ledger'
+    if not records:
+        records = _gb_rpo_source_records(fact_audit, out.columns)
+        source_basis = 'selected_fact_audit'
+
+    if not records:
+        if existing_snapshot is not None and not existing_snapshot.empty:
+            for idx, row in existing_snapshot.iterrows():
+                label = str(idx[1])
+                label = re.sub(r'^RPO\s*-\s*Totals$', 'RPO - Total', label,
+                               flags=re.I)
+                new_idx = (OPERATING_METRICS_CATEGORY, label)
+                values = pd.to_numeric(row, errors='coerce')
+                if new_idx in out.index:
+                    current = pd.to_numeric(out.loc[new_idx], errors='coerce')
+                    values = current.combine_first(values)
+                out.loc[new_idx, :] = values.values
+        out.attrs.update(attrs)
+        return out
+
+    base_records = [
+        record for record in records
+        if record['concept'] == 'RevenueRemainingPerformanceObligation'
+        and record['value_kind'] == 'monetary'
+    ]
+    direct_total_periods = {
+        record['period'] for record in base_records
+        if not record['has_dimensions']
+    }
+    domain_total_periods = {
+        record['period'] for record in base_records
+        if record['has_domain_member'] and not record['other_members']
+    }
+
+    date_only_by_period = defaultdict(list)
+    for record in base_records:
+        if (record['timing_members'] and not record['other_members']
+                and not record['has_domain_member']):
+            date_only_by_period[record['period']].append(record)
+    next_day_total_periods = set()
+    for period, period_records in date_only_by_period.items():
+        if len(period_records) != 1:
+            continue
+        record = period_records[0]
+        if len(record['timing_members']) != 1 or pd.isna(record['end_date']):
+            continue
+        member_date = pd.to_datetime(record['timing_members'][0], errors='coerce')
+        if (pd.notna(member_date)
+                and member_date.normalize()
+                == (record['end_date'] + pd.Timedelta(days=1)).normalize()):
+            next_day_total_periods.add(period)
+    repeated_next_day_total = len(next_day_total_periods) >= 3
+
+    candidates = []
+    for record in records:
+        concept_key = record['concept'].casefold()
+        label = None
+        role_priority = 0
+
+        if record['value_kind'] == 'percentage' or 'percentage' in concept_key:
+            label = 'RPO - Next 12 Months (%)'
+            role_priority = 700
+        elif _RPO_DURATION_CONCEPT_TOKEN in concept_key:
+            continue
+        elif ('contractswithanoriginaltermless' in concept_key
+              and 'oneyear' in concept_key):
+            label = 'RPO - Original Term Under One Year'
+            role_priority = 700
+        elif record['other_members']:
+            label = 'RPO - ' + ' - '.join(record['other_members'])
+            role_priority = 550
+        elif not record['has_dimensions']:
+            label = 'RPO - Total'
+            role_priority = 850
+        elif record['has_domain_member']:
+            label = 'RPO - Total'
+            role_priority = 800
+        elif record['timing_members']:
+            timing_date = record['timing_members'][0]
+            if (record['period'] not in direct_total_periods
+                    and record['period'] not in domain_total_periods
+                    and repeated_next_day_total
+                    and record['period'] in next_day_total_periods
+                    and len(record['timing_members']) == 1):
+                label = 'RPO - Total'
+                role_priority = 700
+            else:
+                label = f'RPO Expected Recognition - {timing_date}'
+                role_priority = 450
+        else:
+            label = 'RPO - Total'
+            role_priority = 350
+
+        source_bonus = 50 if record['source_kind'] == 'xbrl' else (
+            35 if record['source_kind'] == 'html_narrative' else 10)
+        direct_bonus = 25 if record['directness'] in {
+            'direct', 'reported', 'calculation_linkbase'} else 0
+        semantic_bonus = 10 if record['semantic_verified'] else 0
+        filed_rank = (record['filed'].value if pd.notna(record['filed']) else -1)
+        candidates.append({
+            'label': label,
+            'period': record['period'],
+            'value': record['value'],
+            'rank': (
+                role_priority,
+                source_bonus,
+                direct_bonus,
+                semantic_bonus,
+                record['trust'],
+                filed_rank,
+                -record['order'],
+            ),
+        })
+
+    best = {}
+    for candidate in candidates:
+        key = (candidate['label'], candidate['period'])
+        prior = best.get(key)
+        if prior is None or candidate['rank'] > prior['rank']:
+            best[key] = candidate
+
+    rows = defaultdict(lambda: pd.Series(np.nan, index=out.columns, dtype=object))
+    for (label, period), candidate in best.items():
+        if period in out.columns:
+            rows[label].loc[period] = candidate['value']
+
+    for label, series in rows.items():
+        out.loc[(OPERATING_METRICS_CATEGORY, label), :] = series.values
+
+    out.attrs.update(attrs)
+    if isinstance(rpo_source_ledger, pd.DataFrame) and not rpo_source_ledger.empty:
+        out.attrs['rpo_source_ledger'] = rpo_source_ledger
+    out.attrs['rpo_operating_metrics_normalized'] = True
+    out.attrs['rpo_operating_metric_labels'] = tuple(sorted(rows))
+    out.attrs['rpo_source_fact_count'] = len(records)
+    out.attrs['rpo_source_basis'] = source_basis
+    if existing_rpo or rows:
+        print(
+            f"  [RPO] Published {len(rows)} normalized operating-metric row(s) "
+            f"from {len(records)} source fact(s) using {source_basis}; removed "
+            f"{len(existing_rpo)} fragmented prior row(s)."
+        )
+    return out
+
 def _native_annual_sort_output(final_pivot, is_financial=False, is_insurance=False):
     return _sort_final_output_pivot(
         final_pivot,
@@ -33967,7 +34618,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-21.native-extraction.v31-period-and-composite-segment-fixes"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-22.native-extraction.v32-rpo-narrative-ledger"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -34137,7 +34788,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v69-post-route-geography-source-lock"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v71-rpo-source-ledger"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -34498,6 +35149,7 @@ def _build_annual_pivoted_data_impl(all_facts, ticker, ye_month, company_name=No
                                     is_oil_gas=False, is_reit=False, limit=None):
     """Build native 10-K annual FY columns without using quarterly/Q4 repair logic."""
     timer = _AnnualStageTimer()
+    _rpo_source_ledger = _gb_build_rpo_source_ledger(pd.DataFrame(all_facts))
 
     with timer.stage('annual_dataframe_create'):
         df = _prepare_native_annual_df(all_facts)
@@ -34738,6 +35390,7 @@ def _build_annual_pivoted_data_impl(all_facts, ticker, ye_month, company_name=No
                 dt = end_by_period.get(col)
                 period_dates[col] = '' if pd.isna(dt) else pd.to_datetime(dt).strftime('%m/%d/%y')
         final_pivot.attrs['period_dates'] = period_dates
+        final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
 
     timer.emit()
     return final_pivot
@@ -34918,6 +35571,7 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
 
         progress.set(90.0, "Annual FY statements built")
         annual_period_dates = dict(final_pivot.attrs.get('period_dates') or {})
+        _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
         annual_period_dates.update({k: v for k, v in period_dates.items() if k in final_pivot.columns})
         if annual_period_dates:
             header_row = pd.DataFrame(
@@ -34926,6 +35580,8 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
                                                 names=['Category', 'Label'])
             )
             final_pivot = pd.concat([header_row, final_pivot])
+            if _rpo_source_ledger is not None:
+                final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
         _final_pivot_cache_set(
             final_cache_key, final_pivot,
             metadata={
@@ -34937,10 +35593,16 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
             },
         )
 
+    _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
     final_pivot = _apply_quality_result_fixes(final_pivot)
+    if _rpo_source_ledger is not None:
+        final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
     final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
     final_pivot = _normalize_output_margin_rows(final_pivot)
     final_pivot = _hide_stale_operating_measure_rows(final_pivot)
+    final_pivot = _gb_normalize_rpo_operating_metrics(
+        final_pivot, final_pivot.attrs.get('fact_audit'),
+        rpo_source_ledger=_rpo_source_ledger)
     final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
     final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
@@ -35916,7 +36578,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 if pd.isna(_existing_date) or not str(_existing_date).strip():
                     final_pivot.at[_period_header_key, _period] = _display_date
 
+        _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
         final_pivot = _apply_quality_result_fixes(final_pivot)
+        if _rpo_source_ledger is not None:
+            final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
         final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
         final_pivot = _gb_apply_audit_backed_segment_publication_repairs(
             final_pivot, _fact_audit)
@@ -35924,6 +36589,9 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _hide_stale_operating_measure_rows(final_pivot)
         final_pivot = _hide_unsupported_trailing_periods(
             final_pivot, protected_periods=period_dates)
+        final_pivot = _gb_normalize_rpo_operating_metrics(
+            final_pivot, _fact_audit,
+            rpo_source_ledger=_rpo_source_ledger)
         # Absolute output boundary: later quality/integrity/concentration stages
         # can create rows after the segment publication gate.  Remove only rows
         # with no numeric period value, preserving explicit zeros and headers.
