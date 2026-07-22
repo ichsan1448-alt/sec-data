@@ -11969,8 +11969,11 @@ def _gb_group_period_basis(group: pd.DataFrame):
     required = {'Concept', 'SourcePeriodBasis'}
     if group is None or group.empty or not required.issubset(group.columns):
         return None
+    html_concept = group['Concept'] == _HTML_BUSINESS_CONCEPT
+    if not html_concept.any():
+        return None
     subset = group[
-        group['Concept'].eq(_HTML_BUSINESS_CONCEPT)
+        html_concept
         & group['SourcePeriodBasis'].notna()
     ].copy()
     if subset.empty:
@@ -12329,14 +12332,22 @@ def _gb_promote_proven_geographic_revenue_history_facts(
         return out
 
     period_cols = [c for c in ('FY', 'Q', 'End', 'Duration') if c in out.columns]
+    value_dtype = out['Value'].dtype
+    values_are_numeric = (
+        pd.api.types.is_bool_dtype(value_dtype)
+        or pd.api.types.is_integer_dtype(value_dtype)
+        or pd.api.types.is_float_dtype(value_dtype)
+    )
 
     def _series_for(category, label):
         sub = out[out['Category'].eq(category) & out['Label'].eq(label)]
         values = defaultdict(list)
         for _, row in sub.iterrows():
             key = tuple(row.get(c) for c in period_cols)
-            value = pd.to_numeric(pd.Series([row.get('Value')]),
-                                  errors='coerce').iloc[0]
+            value = row.get('Value')
+            if not values_are_numeric:
+                value = pd.to_numeric(
+                    pd.Series([value]), errors='coerce').iloc[0]
             if pd.notna(value):
                 values[key].append(float(value))
         return values
@@ -12374,8 +12385,10 @@ def _gb_promote_proven_geographic_revenue_history_facts(
             candidate_series = defaultdict(list)
             for _, row in candidate_rows.iterrows():
                 key = tuple(row.get(c) for c in period_cols)
-                value = pd.to_numeric(pd.Series([row.get('Value')]),
-                                      errors='coerce').iloc[0]
+                value = row.get('Value')
+                if not values_are_numeric:
+                    value = pd.to_numeric(
+                        pd.Series([value]), errors='coerce').iloc[0]
                 if pd.notna(value):
                     candidate_series[key].append(float(value))
             canonical_series = target_series[distinct.pop()]
@@ -16113,9 +16126,16 @@ def _gb_consolidate_pivot_segment_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
         return df
     out = df.copy()
+    # ``DataFrame.attrs`` contains large audit ledgers.  Pandas deep-copies
+    # attrs during row selection/drop operations, so temporarily detach the
+    # already-deep-copied attrs while this helper works on its independent
+    # frame, then restore them on every return path.
+    out_attrs = out.attrs
+    out.attrs = {}
     indices = [idx for idx in out.index
                if idx[0] == '4a_Segments_Business']
     if len(indices) < 2:
+        out.attrs = out_attrs
         return out
     low_specificity = {
         'other segment item', 'other cost and expense',
@@ -16211,6 +16231,7 @@ def _gb_consolidate_pivot_segment_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     if renamed:
         print('  [Semantic Gate] Final pivot duplicate cleanup: '
               + '; '.join(sorted(set(renamed))))
+    out.attrs = out_attrs
     return out
 
 
@@ -20896,6 +20917,10 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     # by category so their stronger aspect-aware arbitration remains isolated.
     df['_OperatingGroupCategory'] = np.where(
         _operating_fact_mask(df), df['Category'].fillna('').astype(str), '')
+    _best_val_ordinal = '_BestValOriginalOrdinal'
+    while _best_val_ordinal in df.columns:
+        _best_val_ordinal += '_'
+    df[_best_val_ordinal] = np.arange(len(df), dtype=np.int64)
 
     final_rows = []
     _incomplete_debt_component_periods = set()
@@ -20949,6 +20974,22 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             return None
         return concept
 
+    def _selection_sort_spec(frame):
+        """Return the unchanged fact-selection ranking for one cohort."""
+        columns = ['Dist']
+        ascending = [True]
+        if cat == OPERATING_METRICS_CATEGORY:
+            if 'SourceAliasPreferred' in frame.columns:
+                columns.append('SourceAliasPreferred'); ascending.append(False)
+            if 'SourceConflict' in frame.columns:
+                columns.append('SourceConflict'); ascending.append(True)
+            if 'SourceTrustScore' in frame.columns:
+                columns.append('SourceTrustScore'); ascending.append(False)
+        columns.extend([
+            '_Filed_dt', 'IsCalculated', 'TagRank', _best_val_ordinal])
+        ascending.extend([False, True, True, True])
+        return columns, ascending
+
     def _duration_candidates(q_label, target_dur, max_distance):
         _key = (q_label, target_dur, max_distance)
         cached = _duration_filter_cache.get(_key)
@@ -20965,6 +21006,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         m = q_group.loc[dist <= max_distance].copy()
         if not m.empty:
             m['Dist'] = dist.loc[m.index].to_numpy()
+            selection_columns, selection_ascending = (
+                _selection_sort_spec(m))
+            m = m.sort_values(
+                selection_columns, ascending=selection_ascending)
+            del m[_best_val_ordinal]
         _duration_filter_cache[_key] = m
         return m
 
@@ -21026,18 +21072,6 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 return None
             m = clean
 
-        _selection_sort = ['Dist']
-        _selection_ascending = [True]
-        if cat == OPERATING_METRICS_CATEGORY:
-            if 'SourceAliasPreferred' in m.columns:
-                _selection_sort.append('SourceAliasPreferred'); _selection_ascending.append(False)
-            if 'SourceConflict' in m.columns:
-                _selection_sort.append('SourceConflict'); _selection_ascending.append(True)
-            if 'SourceTrustScore' in m.columns:
-                _selection_sort.append('SourceTrustScore'); _selection_ascending.append(False)
-        _selection_sort.extend(['_Filed_dt', 'IsCalculated', 'TagRank'])
-        _selection_ascending.extend([False, True, True])
-        m = m.sort_values(_selection_sort, ascending=_selection_ascending)
         selected = m.iloc[0].copy()
         result = (float(selected['Value']), selected)
         _best_val_cache[_cache_key] = result
@@ -21352,6 +21386,71 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         """Create auditable provenance for a mathematically derived quarter."""
         row = template.copy()
         operands = operands or {}
+        # Selected fact rows are heterogeneous object Series with a unique
+        # object index.  Most provenance fields do not exist yet; assigning
+        # them one at a time repeatedly reallocates/grows the Series.  Grow the
+        # index once, then replay the exact same ordered scalar assignments.
+        # Unusual Series/index shapes retain the historical path below.
+        if (row.dtype == object
+                and type(operands) is dict
+                and type(row.index) is pd.Index
+                and row.index.dtype == object
+                and row.index.is_unique):
+            updates = [
+                ('FY', fiscal_year),
+                ('Q', quarter),
+                ('Value', value),
+                ('IsCalculated', True),
+                ('SourceReportedValue', np.nan),
+                ('SourceDerivation', derivation),
+                ('SourceDerivationFormula',
+                 operands.get('Expression', derivation)),
+                ('SourcePeriodRole', 'derived_discrete'),
+            ]
+            valid_bounds = False
+            if start is not None and end is not None:
+                start_dt = _parse_plain_date_cached(start)
+                end_dt = _parse_plain_date_cached(end)
+                if (pd.notna(start_dt) and pd.notna(end_dt)
+                        and end_dt >= start_dt):
+                    updates.extend([
+                        ('Start', start_dt.strftime('%Y-%m-%d')),
+                        ('End', end_dt.strftime('%Y-%m-%d')),
+                        ('Duration', int((end_dt - start_dt).days)),
+                    ])
+                    valid_bounds = True
+            if not valid_bounds:
+                updates.extend([
+                    ('Start', np.nan),
+                    ('End', np.nan),
+                    ('Duration', np.nan),
+                ])
+            updates.extend(
+                (f'SourceDerivation{key}', operand)
+                for key, operand in operands.items())
+
+            existing = set(row.index)
+            missing = []
+            first_missing_values = []
+            for key, operand in updates:
+                if key not in existing:
+                    existing.add(key)
+                    missing.append(key)
+                    first_missing_values.append(operand)
+            # Growing an object Series converts these ordinary scalar types in
+            # the same way as preallocation.  Less common scalar/container
+            # types retain the literal historical growth path below so their
+            # exact Python/NumPy scalar classes cannot change.
+            plain_missing_types = (str, int, float, bool, type(None))
+            if all(type(item) in plain_missing_types
+                   for item in first_missing_values):
+                if missing:
+                    row = row.reindex(row.index.append(pd.Index(
+                        missing, dtype=object, name=row.index.name)))
+                for key, operand in updates:
+                    row[key] = operand
+                return row
+
         row['FY'] = fiscal_year
         row['Q'] = quarter
         row['Value'] = value
@@ -22302,6 +22401,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     
     final_df = pd.DataFrame(final_rows)
     if final_df.empty: return pd.DataFrame()
+    final_df = final_df.drop(
+        columns=[_best_val_ordinal], errors='ignore')
     _final_operating_mask = final_df['Category'].eq(
         OPERATING_METRICS_CATEGORY)
     _final_non_operating = final_df.loc[~_final_operating_mask].sort_values(
@@ -23577,10 +23678,8 @@ def _effective_capex_series(df: pd.DataFrame) -> pd.Series:
         ~capex_missing_or_stale_zero, detail_sum.where(detail_mask))
 
     evidence = _quality_evidence_attrs(df)
-    verified_totals = evidence.get(_ADDITIVE_CAPEX_TOTALS_ATTR, {})
+    verified_totals = evidence.get(_ADDITIVE_CAPEX_TOTALS_ATTR)
     if not isinstance(verified_totals, dict):
-        verified_totals = {}
-    if not verified_totals:
         # Backward-compatible fallback for an in-memory frame created before
         # immutable totals were attached.  Recompute from selected raw facts,
         # never from the possibly normalized display row.
@@ -33743,6 +33842,11 @@ def _normalize_output_margin_rows(final_pivot):
         'Metric: FCF Margin %': 'FCF Margin (%)',
     }
     result = final_pivot.copy()
+    # The pivot carries large audit DataFrames in ``attrs``.  Keep the one
+    # deep copy made above, but do not make pandas propagate it through every
+    # row selection, drop, or rename performed by this local transformation.
+    result_attrs = result.attrs
+    result.attrs = {}
     for legacy_label, public_label in aliases.items():
         legacy_idx = ('5_KPI_Metrics', legacy_label)
         public_idx = ('5_KPI_Metrics', public_label)
@@ -33757,6 +33861,7 @@ def _normalize_output_margin_rows(final_pivot):
             result = result.drop(index=legacy_idx)
         else:
             result = result.rename(index={legacy_label: public_label}, level='Label')
+    result.attrs = result_attrs
     return result
 
 
@@ -35697,7 +35802,7 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     return out_path
 
 def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
-         save_xlsx=False, workers=None, annual=False):
+         save_xlsx=False, workers=None, annual=False, save_quality=False):
     _initialize_sec_identity()
     import builtins
     _original_print = builtins.print
@@ -36681,20 +36786,22 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         out_dir = "output/financials"
         os.makedirs(out_dir, exist_ok=True)
 
-        if isinstance(_fact_audit, pd.DataFrame) and not _fact_audit.empty:
-            quality_dir = "output/quality"
-            os.makedirs(quality_dir, exist_ok=True)
-            audit_path = f"{quality_dir}/{ticker}_fact_audit.csv"
-            _profile_call("write_csv", _fact_audit.to_csv, audit_path,
-                          index=False, lineterminator="\n")
-        if (isinstance(_operating_alias_audit, pd.DataFrame)
-                and not _operating_alias_audit.empty):
-            quality_dir = "output/quality"
-            os.makedirs(quality_dir, exist_ok=True)
-            alias_audit_path = f"{quality_dir}/{ticker}_operating_alias_audit.csv"
-            _profile_call(
-                "write_csv", _operating_alias_audit.to_csv,
-                alias_audit_path, index=False, lineterminator="\n")
+        if save_quality:
+            if isinstance(_fact_audit, pd.DataFrame) and not _fact_audit.empty:
+                quality_dir = "output/quality"
+                os.makedirs(quality_dir, exist_ok=True)
+                audit_path = f"{quality_dir}/{ticker}_fact_audit.csv"
+                _profile_call("write_csv", _fact_audit.to_csv, audit_path,
+                              index=False, lineterminator="\n")
+            if (isinstance(_operating_alias_audit, pd.DataFrame)
+                    and not _operating_alias_audit.empty):
+                quality_dir = "output/quality"
+                os.makedirs(quality_dir, exist_ok=True)
+                alias_audit_path = (
+                    f"{quality_dir}/{ticker}_operating_alias_audit.csv")
+                _profile_call(
+                    "write_csv", _operating_alias_audit.to_csv,
+                    alias_audit_path, index=False, lineterminator="\n")
         
         if save_xlsx:
             # Create the excel sub-folder inside output/financials/
@@ -36763,7 +36870,7 @@ def _normalize_ticker_queue(tickers):
 def _queue_child_command(
         ticker, limit, use_arelle=False, log_output=False,
         save_xlsx=False, workers=None, annual=False,
-        result_file=None):
+        result_file=None, save_quality=False):
     """Build the one-ticker child command used by the parent queue."""
     command = [
         sys.executable,
@@ -36784,6 +36891,8 @@ def _queue_child_command(
         command.extend(['--workers', str(int(workers))])
     if annual:
         command.append('--annual')
+    if save_quality:
+        command.append('--quality')
     return command
 
 
@@ -36808,7 +36917,7 @@ def _write_queue_child_result(path, payload):
 def run_ticker_queue(
         tickers, limit, use_arelle=False, dqc_ruleset=None,
         log_output=False, save_xlsx=False, workers=None, annual=False,
-        stop_on_error=False):
+        stop_on_error=False, save_quality=False):
     """Run ticker jobs serially with one fresh Python process per company.
 
     The parent waits for each child to exit and save its output before launching
@@ -36836,6 +36945,7 @@ def run_ticker_queue(
                 save_xlsx=save_xlsx,
                 workers=workers,
                 annual=annual,
+                save_quality=save_quality,
             )
             return [{
                 'ticker': ticker,
@@ -36887,6 +36997,7 @@ def run_ticker_queue(
                 workers=workers,
                 annual=annual,
                 result_file=result_path,
+                save_quality=save_quality,
             )
             completed = subprocess.run(command, check=False)
             if result_path and os.path.exists(result_path):
@@ -36990,6 +37101,14 @@ if __name__ == "__main__":
     parser.add_argument("--annual", action="store_true",
                         help="For native 10-K filers, fetch 10-K/10-K/A annual filings only and output FY columns.")
     parser.add_argument(
+        "--quality", "--save-quality", dest="save_quality",
+        action="store_true",
+        help=(
+            "Also save fact-audit and operating-alias CSV files under "
+            "output/quality. By default, only the financial output is saved."
+        ),
+    )
+    parser.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop the ticker queue immediately when one ticker fails. "
@@ -37019,6 +37138,7 @@ if __name__ == "__main__":
                 save_xlsx=args.xlsx,
                 workers=args.workers,
                 annual=args.annual,
+                save_quality=args.save_quality,
             )
             child_payload = {
                 'ticker': ticker,
@@ -37049,6 +37169,7 @@ if __name__ == "__main__":
                 workers=args.workers,
                 annual=args.annual,
                 stop_on_error=args.stop_on_error,
+                save_quality=args.save_quality,
             )
         except ValueError as exc:
             parser.error(str(exc))
