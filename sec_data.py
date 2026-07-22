@@ -27056,6 +27056,462 @@ def _gb_refresh_segment_footing_v96(df: pd.DataFrame) -> pd.DataFrame:
     out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
     return out
 
+
+# ---------------------------------------------------------------------------
+# v97 presentation-basis-locked Q4 cross-tab restoration
+# ---------------------------------------------------------------------------
+_GB_CROSS_TAB_COMPONENTS = ('Product', 'Subscriptions and Services')
+_GB_CROSS_TAB_RECLASS_TEXT_CACHE = {}
+
+
+def _gb_build_cross_tab_q4_source_ledger(raw_facts) -> pd.DataFrame:
+    """Capture raw region-by-type revenue facts before Q4 arbitration.
+
+    The final displayed cross-tab may contain discrete values derived from
+    annual and YTD facts.  Preserve the original filing accession, duration,
+    and filing date so a Q4 repair can select one coherent presentation basis
+    instead of mixing later-restated comparatives with older quarterly facts.
+    """
+    if raw_facts is None:
+        return pd.DataFrame()
+    raw = raw_facts.copy() if isinstance(raw_facts, pd.DataFrame) else pd.DataFrame(raw_facts)
+    required = {'Category', 'Label', 'Value', 'FY', 'Q'}
+    if raw.empty or not required.issubset(raw.columns):
+        return pd.DataFrame()
+    label = raw['Label'].fillna('').astype(str)
+    mask = (
+        raw['Category'].fillna('').astype(str).eq('4d_Segments_Cross_Tabulated')
+        & label.str.match(
+            r'^Revenue - .+ - (?:Product|Subscriptions and Services)$',
+            case=False, na=False)
+    )
+    ledger = raw.loc[mask].copy()
+    if ledger.empty:
+        return ledger
+    ledger['Value'] = pd.to_numeric(ledger['Value'], errors='coerce')
+    ledger['FY'] = pd.to_numeric(ledger['FY'], errors='coerce')
+    ledger['Duration'] = pd.to_numeric(
+        ledger.get('Duration', pd.Series(index=ledger.index, dtype=float)),
+        errors='coerce')
+    ledger['Filed'] = pd.to_datetime(
+        ledger.get('Filed', pd.Series(index=ledger.index, dtype=object)),
+        errors='coerce')
+    parts = ledger['Label'].str.extract(
+        r'^Revenue - (?P<Parent>.+) - (?P<Component>Product|Subscriptions and Services)$',
+        flags=re.I)
+    ledger['CrossTabParent'] = parts['Parent'].str.strip()
+    ledger['CrossTabComponent'] = parts['Component'].map(
+        lambda value: 'Product' if str(value).casefold() == 'product'
+        else 'Subscriptions and Services')
+    ledger = ledger[
+        ledger['Value'].notna()
+        & ledger['FY'].notna()
+        & ledger['CrossTabParent'].notna()
+        & ledger['CrossTabComponent'].notna()
+    ].copy()
+    keep = [
+        'Category', 'Label', 'Value', 'FY', 'Q', 'Start', 'End', 'Duration',
+        'Filed', 'Form', 'Accession', 'FilingUrl', 'Concept', 'DimCount',
+        'SourceKind', 'SourceAdmissionRule', 'SourceDirectness',
+        'SourceTableRole', 'SourceDimensionAxes', 'SourceDimensionMembers',
+        'SourceAxisSignature', 'SourceMemberSignature',
+        'CrossTabParent', 'CrossTabComponent',
+    ]
+    keep = [column for column in keep if column in ledger.columns]
+    ledger = ledger[keep].drop_duplicates().reset_index(drop=True)
+    return ledger
+
+
+def _gb_normalize_cross_tab_region_name(value) -> str:
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    lower = text.casefold()
+    if 'america' in lower:
+        return 'Americas'
+    if 'asia' in lower:
+        return 'Asia'
+    if ('europe' in lower and 'middle east' in lower) or lower in {'emea'}:
+        return 'EMEA'
+    return text
+
+
+@retry_sec_request(retries=3, delay=5)
+def _gb_fetch_filing_url_text_uncached(url: str) -> str:
+    response = _SHARED_HTTP_CLIENT.get(
+        str(url),
+        headers={
+            'User-Agent': _sec_user_agent(),
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Encoding': 'gzip, deflate',
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _gb_fetch_filing_url_text_cached(url: str) -> str:
+    url = str(url or '').strip()
+    if not url:
+        return ''
+    with _FETCH_CACHE_LOCK:
+        cached = _GB_CROSS_TAB_RECLASS_TEXT_CACHE.get(url)
+    if cached is not None:
+        return cached
+    persistent_key = (
+        'cross-tab-reclassification-text',
+        _persistent_cache_source_fingerprint(),
+        url,
+    )
+    persistent = _persistent_html_cache_get(
+        'cross_tab_reclassification_text', persistent_key)
+    if persistent is not _PERSISTENT_HTML_CACHE_MISS:
+        text = str(persistent or '')
+        with _FETCH_CACHE_LOCK:
+            return _GB_CROSS_TAB_RECLASS_TEXT_CACHE.setdefault(url, text)
+    try:
+        text = _gb_fetch_filing_url_text_uncached(url)
+    except Exception as exc:
+        _debug_print(
+            f"  [Cross-Tab Basis] Could not read annual filing narrative "
+            f"({type(exc).__name__}).")
+        text = ''
+    if text:
+        _persistent_html_cache_set(
+            'cross_tab_reclassification_text', persistent_key, text)
+    with _FETCH_CACHE_LOCK:
+        return _GB_CROSS_TAB_RECLASS_TEXT_CACHE.setdefault(url, text)
+
+
+def _gb_cross_tab_reclassification_adjustments_from_text(text) -> pd.DataFrame:
+    """Parse only explicit region-level product/service reclassifications.
+
+    Accepted sentences must contain three monetary amounts, three semicolon-
+    separated regions, the direction from subscriptions/services to products,
+    and an explicit fiscal year.  This intentionally rejects generic acquisition
+    prose, aggregate-only amounts, and any sentence without a region mapping.
+    """
+    if not text:
+        return pd.DataFrame(columns=[
+            'FY', 'Region', 'Amount', 'AdjustmentKind', 'Evidence'])
+    try:
+        visible = BeautifulSoup(str(text), 'html.parser').get_text(' ', strip=True)
+    except Exception:
+        visible = str(text)
+    visible = html_lib.unescape(visible).replace('\xa0', ' ')
+    visible = re.sub(r'\s+', ' ', visible).strip()
+
+    amount_token = r'\$\s*([\d,]+(?:\.\d+)?)\s*million'
+    amounts_three = (
+        amount_token + r'\s*,\s*' + amount_token
+        + r'\s*,?\s*(?:and\s+)?' + amount_token)
+    regions = (
+        r'within\s+the\s+(.+?)\s*;\s*(.+?)\s*;\s*and\s+(.+?)\s+'
+        r'regions?\s*,?\s*respectively')
+    patterns = [
+        (
+            'included_in_annual_product',
+            re.compile(
+                r'we\s+included\s+' + amounts_three
+                + r'\s+of\s+upfront\s+license\s+revenue\s+in\s+products?\s+revenue\s+'
+                + regions + r'\s*,?\s*for\s+fiscal\s+year\s+(\d{4})',
+                re.I),
+        ),
+        (
+            'reclassified_to_annual_product',
+            re.compile(
+                r'we\s+reclassified\s+' + amounts_three
+                + r'\s+of\s+upfront\s+license\s+revenue\s+from\s+'
+                r'subscriptions?\s+and\s+services?\s+revenue\s+to\s+products?\s+revenue\s+'
+                + regions + r'\s*,?\s*for\s+fiscal\s+year\s+(\d{4})',
+                re.I),
+        ),
+    ]
+    rows = []
+    for kind, pattern in patterns:
+        for match in pattern.finditer(visible):
+            groups = match.groups()
+            if len(groups) != 7:
+                continue
+            raw_amounts = groups[:3]
+            raw_regions = groups[3:6]
+            try:
+                fy = int(groups[6])
+                amounts = [float(value.replace(',', '')) * 1_000_000.0
+                           for value in raw_amounts]
+            except Exception:
+                continue
+            normalized_regions = [
+                _gb_normalize_cross_tab_region_name(region)
+                for region in raw_regions]
+            if len(set(normalized_regions)) != 3 or any(amount <= 0 for amount in amounts):
+                continue
+            evidence = match.group(0)[:500]
+            for region, amount in zip(normalized_regions, amounts):
+                rows.append({
+                    'FY': fy,
+                    'Region': region,
+                    'Amount': amount,
+                    'AdjustmentKind': kind,
+                    'Evidence': evidence,
+                })
+    result = pd.DataFrame(rows, columns=[
+        'FY', 'Region', 'Amount', 'AdjustmentKind', 'Evidence'])
+    if result.empty:
+        return result
+    # Conflicting duplicate statements are unsafe; retain only exact agreement.
+    safe = []
+    for key, group in result.groupby(['FY', 'Region'], sort=False):
+        values = pd.to_numeric(group['Amount'], errors='coerce').dropna().unique()
+        if len(values) != 1:
+            continue
+        preferred = group.sort_values(
+            'AdjustmentKind', key=lambda series: series.map({
+                'included_in_annual_product': 0,
+                'reclassified_to_annual_product': 1,
+            }).fillna(9)).iloc[0]
+        safe.append(preferred.to_dict())
+    return pd.DataFrame(safe, columns=result.columns)
+
+
+def _gb_cross_tab_complete_source_families(
+        ledger: pd.DataFrame, fy: int, labels: tuple[str, ...]):
+    if ledger is None or ledger.empty:
+        return [], []
+    subset = ledger[pd.to_numeric(ledger['FY'], errors='coerce').eq(int(fy))].copy()
+    subset = subset[subset['Label'].isin(labels)]
+    if subset.empty:
+        return [], []
+    annual_groups, ytd_groups = [], []
+    for accession, group in subset.groupby('Accession', dropna=False, sort=False):
+        if pd.isna(accession):
+            continue
+        by_label = group.sort_values(
+            ['Filed', 'Duration'], ascending=[False, False]).drop_duplicates(
+                ['Label', 'Duration', 'Start', 'End'], keep='first')
+        annual = by_label[
+            by_label['Q'].astype(str).eq('Q4')
+            & by_label['Duration'].between(330, 390, inclusive='both')
+        ]
+        ytd = by_label[
+            by_label['Q'].astype(str).eq('Q3')
+            & by_label['Duration'].between(240, 310, inclusive='both')
+        ]
+        for frame, destination in ((annual, annual_groups), (ytd, ytd_groups)):
+            candidate = frame.sort_values('Filed', ascending=False).drop_duplicates(
+                'Label', keep='first')
+            if set(labels).issubset(set(candidate['Label'])):
+                destination.append(candidate[candidate['Label'].isin(labels)].copy())
+    return annual_groups, ytd_groups
+
+
+def _gb_cross_tab_candidate_values(group: pd.DataFrame) -> dict:
+    return {
+        str(row.Label): float(row.Value)
+        for row in group.itertuples()
+        if pd.notna(row.Value)
+    }
+
+
+def _gb_cross_tab_q4_values_validate(
+        values: dict, parent_totals: dict, consolidated_total=None) -> bool:
+    if not values or not parent_totals:
+        return False
+    region_sums = []
+    for parent, parent_total in parent_totals.items():
+        product = values.get(f'Revenue - {parent} - Product')
+        services = values.get(
+            f'Revenue - {parent} - Subscriptions and Services')
+        if product is None or services is None:
+            return False
+        if not np.isfinite(product) or not np.isfinite(services):
+            return False
+        tolerance = max(2_000_000.0, abs(float(parent_total)) * 0.001)
+        if product < -tolerance or services < -tolerance:
+            return False
+        if abs((product + services) - float(parent_total)) > tolerance:
+            return False
+        region_sums.append(float(parent_total))
+    if consolidated_total is not None and pd.notna(consolidated_total):
+        tolerance = max(3_000_000.0, abs(float(consolidated_total)) * 0.001)
+        if abs(sum(region_sums) - float(consolidated_total)) > tolerance:
+            return False
+    return True
+
+
+def _gb_restore_basis_consistent_q4_cross_tabs(
+        df: pd.DataFrame, source_ledger: pd.DataFrame | None,
+        html_loader=None) -> pd.DataFrame:
+    """Restore Q4 region-by-type revenue from one coherent filing basis.
+
+    First use the earliest complete annual 10-K after the Q3 filing and the
+    closest complete nine-month 10-Q before it.  When that direct subtraction
+    fails, reverse only an explicit region-level annual product reclassification
+    parsed from the annual filing narrative.  No interpolation or largest-value
+    heuristic is used, and valid existing Q4 cells are never overwritten.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or source_ledger is None or source_ledger.empty):
+        return df
+    out = df.copy()
+    html_loader = html_loader or _gb_fetch_filing_url_text_cached
+    parents = defaultdict(dict)
+    for idx in out.index:
+        if idx[0] != '4d_Segments_Cross_Tabulated':
+            continue
+        match = re.match(
+            r'^Revenue - (.+) - (Product|Subscriptions and Services)$',
+            str(idx[1]), re.I)
+        if not match:
+            continue
+        parent = match.group(1).strip()
+        component = ('Product' if match.group(2).casefold() == 'product'
+                     else 'Subscriptions and Services')
+        parents[parent][component] = idx
+    parents = {
+        parent: components for parent, components in parents.items()
+        if set(components) == set(_GB_CROSS_TAB_COMPONENTS)
+    }
+    if not parents:
+        return df
+    labels = tuple(
+        f'Revenue - {parent} - {component}'
+        for parent in sorted(parents)
+        for component in _GB_CROSS_TAB_COMPONENTS)
+    restored = []
+    audit_rows = []
+    for period in out.columns:
+        match = re.fullmatch(r'(\d{4})-Q4', str(period))
+        if not match:
+            continue
+        fy = int(match.group(1))
+        parent_totals = {}
+        for parent in parents:
+            parent_idx = next((
+                idx for idx in (
+                    ('4b_Segments_Geographic_Regions', f'Revenue - {parent}'),
+                    ('4c_Segments_Geographic_Countries', f'Revenue - {parent}'),
+                ) if idx in out.index), None)
+            if parent_idx is None:
+                continue
+            value = pd.to_numeric(
+                pd.Series([out.at[parent_idx, period]]), errors='coerce').iloc[0]
+            if pd.notna(value) and float(value) > 0:
+                parent_totals[parent] = float(value)
+        if set(parent_totals) != set(parents):
+            continue
+        consolidated = None
+        revenue_idx = ('1_Income_Statement', 'Revenue')
+        if revenue_idx in out.index:
+            consolidated = pd.to_numeric(
+                pd.Series([out.at[revenue_idx, period]]), errors='coerce').iloc[0]
+        current = {
+            label: pd.to_numeric(
+                pd.Series([out.at[('4d_Segments_Cross_Tabulated', label), period]]),
+                errors='coerce').iloc[0]
+            for label in labels
+            if ('4d_Segments_Cross_Tabulated', label) in out.index
+        }
+        current_numeric = {label: float(value) for label, value in current.items()
+                           if pd.notna(value)}
+        if (len(current_numeric) == len(labels)
+                and _gb_cross_tab_q4_values_validate(
+                    current_numeric, parent_totals, consolidated)):
+            continue
+
+        annual_groups, ytd_groups = _gb_cross_tab_complete_source_families(
+            source_ledger, fy, labels)
+        if not annual_groups or not ytd_groups:
+            continue
+        pairs = []
+        for annual in annual_groups:
+            annual_filed = annual['Filed'].max()
+            for ytd in ytd_groups:
+                ytd_filed = ytd['Filed'].max()
+                if pd.isna(annual_filed) or pd.isna(ytd_filed) or ytd_filed > annual_filed:
+                    continue
+                days = (annual_filed - ytd_filed).days
+                if days < 0 or days > 240:
+                    continue
+                pairs.append((annual_filed, days, annual, ytd))
+        if not pairs:
+            continue
+        # Earliest annual filing for this fiscal year preserves the original
+        # reporting cycle; nearest prior Q3 filing supplies the 9M basis.
+        pairs.sort(key=lambda item: (item[0], item[1]))
+        annual_filed, _days, annual, ytd = pairs[0]
+        annual_values = _gb_cross_tab_candidate_values(annual)
+        ytd_values = _gb_cross_tab_candidate_values(ytd)
+        derived = {
+            label: annual_values[label] - ytd_values[label]
+            for label in labels
+        }
+        method = 'same_basis_annual_minus_9m'
+
+        if not _gb_cross_tab_q4_values_validate(
+                derived, parent_totals, consolidated):
+            filing_urls = [str(url).strip() for url in annual.get(
+                'FilingUrl', pd.Series(dtype=object)).dropna().unique()
+                if str(url).strip()]
+            if not filing_urls:
+                continue
+            text = html_loader(filing_urls[0])
+            adjustments = _gb_cross_tab_reclassification_adjustments_from_text(text)
+            if adjustments.empty:
+                continue
+            adjustments = adjustments[
+                pd.to_numeric(adjustments['FY'], errors='coerce').eq(fy)]
+            adjustment_map = {
+                _gb_normalize_cross_tab_region_name(row.Region): float(row.Amount)
+                for row in adjustments.itertuples()
+            }
+            if set(adjustment_map) != set(parents):
+                continue
+            adjusted_annual = dict(annual_values)
+            for parent, amount in adjustment_map.items():
+                product_label = f'Revenue - {parent} - Product'
+                services_label = (
+                    f'Revenue - {parent} - Subscriptions and Services')
+                adjusted_annual[product_label] -= amount
+                adjusted_annual[services_label] += amount
+            derived = {
+                label: adjusted_annual[label] - ytd_values[label]
+                for label in labels
+            }
+            method = 'annual_reclassification_reversed_minus_9m'
+            if not _gb_cross_tab_q4_values_validate(
+                    derived, parent_totals, consolidated):
+                continue
+
+        for label, value in derived.items():
+            idx = ('4d_Segments_Cross_Tabulated', label)
+            if idx not in out.index:
+                out.loc[idx, :] = np.nan
+            tolerance = 2_000_000.0
+            if abs(value) <= tolerance:
+                value = 0.0
+            out.at[idx, period] = float(value)
+            audit_rows.append({
+                'Period': period,
+                'Label': label,
+                'Value': float(value),
+                'Method': method,
+                'AnnualAccession': str(annual['Accession'].iloc[0]),
+                'YTDAccession': str(ytd['Accession'].iloc[0]),
+            })
+        restored.append(f'{period} ({method})')
+    if restored:
+        print('  [Cross-Tab Basis] Restored coherent Q4 decompositions: '
+              + ', '.join(restored))
+        out.attrs['cross_tab_q4_basis_audit'] = pd.DataFrame(audit_rows)
+    out.attrs.update({
+        key: value for key, value in (dict(getattr(df, 'attrs', {}) or {})).items()
+        if key != 'cross_tab_q4_basis_audit'
+    })
+    if audit_rows:
+        out.attrs['cross_tab_q4_basis_audit'] = pd.DataFrame(audit_rows)
+    return out
+
+
 def _gb_quarantine_nonclosing_cross_tab_revenue(df: pd.DataFrame) -> pd.DataFrame:
     """Blank cross-tab component cells that fail their own top-level region total."""
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
@@ -27108,10 +27564,14 @@ def _gb_drop_rpo_taxonomy_artifacts(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _gb_apply_v96_output_repairs(df: pd.DataFrame, fact_audit=None) -> pd.DataFrame:
+def _gb_apply_v96_output_repairs(
+        df: pd.DataFrame, fact_audit=None,
+        cross_tab_source_ledger: pd.DataFrame | None = None) -> pd.DataFrame:
     out = _gb_restore_or_reconstruct_liabilities_v96(df, fact_audit)
     out = _gb_refresh_debt_and_net_cash_kpis_v96(out, fact_audit)
     out = _gb_reclassify_nonsemantic_segment_rows(out)
+    out = _gb_restore_basis_consistent_q4_cross_tabs(
+        out, cross_tab_source_ledger)
     out = _gb_quarantine_nonclosing_cross_tab_revenue(out)
     out = _gb_drop_rpo_taxonomy_artifacts(out)
     out = _gb_refresh_balance_sheet_footing_v96(out)
@@ -35533,7 +35993,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v73-accounting-segment-guards"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v74-cross-tab-basis-lock"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -36294,7 +36754,10 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     # attrs, and company-specific repair paths can therefore lose the ledger.
     # Rebuilding once from the immutable raw facts makes cold and warm-cache
     # behavior identical and avoids repeatedly copying a large attrs DataFrame.
-    _rpo_source_ledger = _gb_build_rpo_source_ledger(pd.DataFrame(all_facts))
+    _raw_fact_frame = pd.DataFrame(all_facts)
+    _rpo_source_ledger = _gb_build_rpo_source_ledger(_raw_fact_frame)
+    _cross_tab_source_ledger = _gb_build_cross_tab_q4_source_ledger(
+        _raw_fact_frame)
 
     final_cache_key = _final_pivot_cache_key(
         ticker, company, "US_NATIVE_ANNUAL_FINAL", limit, ye_month, use_arelle, filings,
@@ -36368,7 +36831,8 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
     final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
     final_pivot = _gb_apply_v96_output_repairs(
-        final_pivot, final_pivot.attrs.get('fact_audit'))
+        final_pivot, final_pivot.attrs.get('fact_audit'),
+        cross_tab_source_ledger=_cross_tab_source_ledger)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
 
     progress.set(98.0, "Writing annual output file")
@@ -36849,7 +37313,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         # immutable source of truth and is available on both cold and warm
         # final-pivot-cache paths.  Relying on attrs survival caused Google and
         # other issuers to fall back to the lossy selected-fact audit.
-        _rpo_source_ledger = _gb_build_rpo_source_ledger(pd.DataFrame(all_facts))
+        _raw_fact_frame = pd.DataFrame(all_facts)
+        _rpo_source_ledger = _gb_build_rpo_source_ledger(_raw_fact_frame)
+        _cross_tab_source_ledger = _gb_build_cross_tab_q4_source_ledger(
+            _raw_fact_frame)
 
         final_cache_key = _final_pivot_cache_key(
             ticker, company, f"{profile.pipeline}_FINAL", limit, ye_month,
@@ -37400,7 +37867,9 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot, _fact_audit)
         final_pivot = _gb_repair_authoritative_nonoperating_face_line(
             final_pivot, _fact_audit)
-        final_pivot = _gb_apply_v96_output_repairs(final_pivot, _fact_audit)
+        final_pivot = _gb_apply_v96_output_repairs(
+            final_pivot, _fact_audit,
+            cross_tab_source_ledger=_cross_tab_source_ledger)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
