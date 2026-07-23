@@ -143,6 +143,16 @@ _CF_NONOPERATING_PARENTS = {
     'NetCashProvidedByUsedInFinancingActivitiesContinuingOperations',
 }
 
+# A filer may migrate between these two standard US-GAAP dividend concepts
+# while preserving the same cumulative cash-flow disclosure.  Cross-concept
+# subtraction is allowed only after an earlier, nonzero, context-identical
+# overlap proves that the two tags carried the same value for that filer.
+# Keeping the exception as an exact concept pair avoids weakening the general
+# same-concept rule for other cash-flow lines.
+_DIVIDEND_CUMULATIVE_TRANSITION_GROUPS = (
+    frozenset({'PaymentsOfDividends', 'PaymentsOfOrdinaryDividends'}),
+)
+
 
 _CF_BRIDGE_SPEC = {}
 _IBM_STYLE_STATE = {'active': False}  # interest folded into the operating-expense block (no separate operating-income line)
@@ -227,6 +237,115 @@ def _recompute_cf_residuals(df):
 
 _CF_SUPPLEMENTAL_MARKERS = ('paid', 'obtained in exchange', 'incurred',
                             'period increase', 'noncash', 'non-cash')
+
+# Cash proceeds from equity issuance must remain separate from share-count and
+# equity-rollforward facts.  These labels are intentionally granular; the
+# legacy ``Shares Issued`` row is derived from them later for compatibility.
+_EQUITY_ISSUANCE_COMPONENT_LABELS = (
+    'Shares Issued - Common Stock',
+    'Shares Issued - Preferred Stock',
+    'Shares Issued - Mandatory Convertible Preferred Stock',
+    'Shares Issued - Combined Common and Preferred Stock',
+    'Shares Issued - Other Equity',
+)
+_EQUITY_ISSUANCE_CASH_LABELS = frozenset(_EQUITY_ISSUANCE_COMPONENT_LABELS)
+
+
+def _compact_equity_issuance_text(*parts):
+    return re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in parts).casefold())
+
+
+def _classify_equity_issuance_line(concept, presentation_label=None):
+    """Classify cash proceeds from issuing equity, conservatively.
+
+    The classifier deliberately requires cash/proceeds language.  It therefore
+    rejects similarly named share-count facts (``...SharesNewIssues``), APIC
+    rollforward values, stock compensation, repurchases, and debt issuance.
+    It is used for custom extension concepts on the financing statement.
+    """
+    text = _compact_equity_issuance_text(concept, presentation_label)
+    if not text:
+        return None
+    has_cash_proceeds = any(token in text for token in (
+        'proceedsfrom', 'netproceeds', 'cashproceeds', 'cashreceivedfrom'))
+    has_issuance = any(token in text for token in (
+        'issuance', 'issued', 'issueof', 'saleof', 'offering'))
+    has_equity = any(token in text for token in (
+        'commonstock', 'preferredstock', 'preferencestock', 'capitalstock',
+        'equity', 'shares'))
+    if not (has_cash_proceeds and has_issuance and has_equity):
+        return None
+
+    # These are distinct financing activities and must not be swept into the
+    # stock-issuance parent merely because they contain words such as
+    # "convertible", "capital", or "shares".
+    if any(token in text for token in (
+            'repurchase', 'buyback', 'redemption', 'treasurystock',
+            'debt', 'notes', 'bonds', 'borrowings', 'commercialpaper',
+            'loan', 'warrant', 'noncontrollinginterest')):
+        # Convertible *preferred stock* is equity, while convertible debt is not.
+        if 'preferredstock' not in text and 'preferencestock' not in text:
+            return None
+    if any(token in text for token in (
+            'stockoption', 'employee', 'sharebased', 'stockbased',
+            'incentiveplan', 'purchaseplan', 'compensationplan', 'espp')):
+        return None
+
+    is_preferred = ('preferredstock' in text or 'preferencestock' in text)
+    is_common = 'commonstock' in text
+    is_mandatory_convertible = (is_preferred and 'mandatory' in text
+                                and 'convertible' in text)
+    if is_mandatory_convertible:
+        return 'Shares Issued - Mandatory Convertible Preferred Stock'
+    if is_common and is_preferred:
+        return 'Shares Issued - Combined Common and Preferred Stock'
+    if is_preferred:
+        return 'Shares Issued - Preferred Stock'
+    if is_common:
+        return 'Shares Issued - Common Stock'
+    return 'Shares Issued - Other Equity'
+
+
+def _fact_has_share_count_unit(row):
+    """Return True only when available unit metadata explicitly says shares.
+
+    edgartools versions have used several unit-column names.  Unknown/missing
+    metadata is allowed so older environments retain their previous behavior;
+    an explicit share or per-share unit is rejected from cash-proceeds rows.
+    """
+    for key in ('unit', 'units', 'unit_ref', 'unitRef', 'unit_id',
+                'unit_measure', 'unitMeasure'):
+        try:
+            value = row.get(key, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        unit_text = str(value).casefold()
+        if 'share' in unit_text or 'stock' in unit_text:
+            return True
+    return False
+
+
+def _register_equity_issuance_alias(concept, target_label):
+    """Register a strict financing-face extension concept as an exact alias."""
+    if not concept or target_label not in _EQUITY_ISSUANCE_CASH_LABELS:
+        return False
+    info = CONCEPT_MAP.get(target_label)
+    if not isinstance(info, dict):
+        return False
+    tags = info.setdefault('tags', [])
+    if concept not in tags:
+        tags.append(concept)
+    _CONCEPT_TAG_TO_LABEL[concept] = target_label
+    _FUZZY_CACHE[concept] = target_label
+    return True
 
 
 def _classify_cf_label_fallback(label, section):
@@ -3446,10 +3565,19 @@ CONCEPT_MAP = {
     'Total Net Debt Issued (Repaid)': {'tags': [], 'cat': '3_Cash_Flow'},
     'Cash Interest Paid': {'tags': ['InterestPaid', 'InterestPaidNet', 'InterestPaidNetOfCapitalizedInterest'], 'cat': '3_Cash_Flow'},
     'Share Repurchases': {'tags': ['PaymentsForRepurchaseOfCommonStock', 'StockRepurchasedDuringPeriodValue', 'StockRepurchasedAndRetiredDuringPeriodValue', 'TreasuryStockValueAcquiredCostMethod', 'TreasuryStockValueAcquiredParValueMethod', 'PaymentsForRepurchaseOfPreferredStock', 'PaymentsForRepurchaseOfEquity', 'StockRepurchasedAndRetiredDuringPeriodShares'], 'cat': '3_Cash_Flow'},
-    'Shares Issued': {'tags': ['ProceedsFromIssuanceOfCommonStock', 'ProceedsFromIssuanceOfPreferredStock', 'ProceedsFromIssuanceOfCommonStockAndPreferredStock', 'StockIssuedDuringPeriodSharesNewIssues'], 'cat': '3_Cash_Flow'},
+    # Monetary equity-issuance proceeds are split by instrument.  The parent
+    # ``Shares Issued`` row is derived in calculate_kpis.  Share-count tags are
+    # intentionally excluded: they belong to disclosures/equity rollforwards,
+    # not the cash-flow statement.
+    'Shares Issued': {'tags': [], 'cat': '3_Cash_Flow'},
+    'Shares Issued - Common Stock': {'tags': ['ProceedsFromIssuanceOfCommonStock'], 'cat': '3_Cash_Flow'},
+    'Shares Issued - Preferred Stock': {'tags': ['ProceedsFromIssuanceOfPreferredStock'], 'cat': '3_Cash_Flow'},
+    'Shares Issued - Mandatory Convertible Preferred Stock': {'tags': [], 'cat': '3_Cash_Flow'},
+    'Shares Issued - Combined Common and Preferred Stock': {'tags': ['ProceedsFromIssuanceOfCommonStockAndPreferredStock'], 'cat': '3_Cash_Flow'},
+    'Shares Issued - Other Equity': {'tags': [], 'cat': '3_Cash_Flow'},
     'Shares Issued (Stock Plans)': {'tags': ['ProceedsFromIssuanceOfSharesUnderStockOptionAndStockPurchasePlans', 'ProceedsFromStockOptionsExercised', 'ProceedsFromIssuanceOfCommonStockUnderEmployeeStockPurchasePlan', 'StockIssuedDuringPeriodValueEmployeeStockPurchasePlan', 'ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlansIncludingStockOptions', 'ProceedsFromStockPlans', 'StockIssuedDuringPeriodSharesRestrictedStockAwardsAndStockOptionsExercised'], 'cat': '3_Cash_Flow'},
     'Net Shares Issued (Repurchased)': {'tags': [], 'cat': '3_Cash_Flow'},
-    'Dividends Paid': {'tags': ['PaymentsOfDividends', 'PaymentsOfDividendsCommonStock', 'PaymentsOfDividendsPreferredStock', 'DividendsCommonStockCash', 'DividendsCash'], 'cat': '3_Cash_Flow'},
+    'Dividends Paid': {'tags': ['PaymentsOfDividends', 'PaymentsOfOrdinaryDividends', 'PaymentsOfDividendsCommonStock', 'PaymentsOfDividendsPreferredStock', 'DividendsCommonStockCash', 'DividendsCash'], 'cat': '3_Cash_Flow'},
     'Taxes Paid on Stock Awards': {'tags': ['PaymentsRelatedToTaxWithholdingForShareBasedCompensation', 'PaymentsOfTaxWithholdingForShareBasedCompensation'], 'cat': '3_Cash_Flow'},
     'Financing Cash Flow': {'tags': ['NetCashProvidedByUsedInFinancingActivities', 'NetCashProvidedByUsedInFinancingActivitiesContinuingOperations', 'NetCashProvidedByUsedInFinancingActivitiesDiscontinuedOperations'], 'cat': '3_Cash_Flow'},
     'Net Cash Flow': {'tags': [], 'cat': '3_Cash_Flow'},
@@ -6413,6 +6541,23 @@ def learn_statement_concepts(xbrl) -> int:
                 if any(s in concept for s in _AUTO_SKIP_SUBSTR):
                     continue
 
+                # Financing-face equity issuance extensions are common and can
+                # be more specific than the US-GAAP taxonomy (for example,
+                # mandatory convertible preferred stock, net of costs).  Use
+                # the filer's face label plus the concept name, but require
+                # strict cash-proceeds semantics so share counts/APIC facts are
+                # never admitted.
+                if cat == '3_Cash_Flow':
+                    _face_label = (getattr(node, 'standard_label', None)
+                                   or getattr(node, 'display_label', None)
+                                   or '')
+                    _equity_target = _classify_equity_issuance_line(
+                        concept, _face_label)
+                    if _equity_target:
+                        _register_equity_issuance_alias(concept, _equity_target)
+                        last_anchor = _equity_target
+                        continue
+
                 # Exact-mapped concept: normally nothing to learn (it
                 # anchors later learned lines) -- UNLESS the company never
                 # presents it on the statement our static map claims. Then
@@ -6623,6 +6768,12 @@ def resolve_custom_tags(calc_trees):
                                 target_label = 'Proceeds from Investments'
                             else: # Purchases are negative to investing
                                 target_label = 'Purchases of Investments'
+                    elif parent_clean in financing_parents:
+                        _node_label = (getattr(node, 'standard_label', None)
+                                       or getattr(node, 'display_label', None)
+                                       or '')
+                        target_label = _classify_equity_issuance_line(
+                            child_clean, _node_label)
                     elif parent_clean in ('InterestIncomeExpenseNet', 'InterestIncomeExpenseOperatingNet', 'InterestIncomeExpenseAfterProvisionForLoanLoss', 'InterestIncomeExpenseNonoperatingNet'):
                         if node.weight > 0:
                             target_label = 'Interest Income'
@@ -13582,6 +13733,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         captured_by_concept_map = False
         target_labels = _tag_to_labels.get(concept)
                 
+        # Strict financing-equity fallback runs before generic fuzzy matching.
+        # This catches issuer extensions even when presentation/calculation
+        # learning is unavailable, while refusing share-count and APIC concepts.
+        if not target_labels and isinstance(val, (int, float)):
+            _equity_target = _classify_equity_issuance_line(concept)
+            if _equity_target:
+                target_labels = (_equity_target,)
+
         # If not matched directly, use fuzzy matcher for numeric facts (ignore text blocks)
         if not target_labels and 'TextBlock' not in concept and isinstance(val, (int, float)):
             # Do not fuzzy match if the concept is explicitly mapped for segment/disclosure extraction
@@ -13616,6 +13775,12 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             if is_consolidated_fact:
                 if not _fact_period_matches_statement_category(info['cat'], _start_dt):
                     continue
+                if target_label in _EQUITY_ISSUANCE_CASH_LABELS:
+                    # A cash-flow issuance fact must be a duration monetary
+                    # amount. Explicit share/per-share units and instant equity
+                    # rollforward facts are not cash proceeds.
+                    if pd.isna(_start_dt) or _fact_has_share_count_unit(row):
+                        continue
                 rank = _tag_rank_lookup.get((target_label, concept), 999)
                 if end_str is None:
                     end_str = end_dt.strftime('%Y-%m-%d')
@@ -20960,6 +21125,55 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _operating_source_periods = _eligible_output_source_periods(
         df.loc[_operating_fact_mask(df)])
 
+    # A cumulative H1 equity-issuance fact can legitimately represent a
+    # transaction that occurred entirely in Q2.  Missing Q1 activity is treated
+    # as zero only when the issuer directly filed all three cash-flow section
+    # totals for Q1.  This is intentionally narrower than a general
+    # missing-equals-zero rule: it applies only to the granular cash equity
+    # issuance labels and requires a complete, source-backed Q1 statement.
+    _direct_cf_total_concepts = {
+        'Operating Cash Flow': _CF_OPERATING_PARENTS,
+        'Investing Cash Flow': _CF_INVESTING_PARENTS,
+        'Financing Cash Flow': _CF_FINANCING_PARENTS,
+    }
+    _direct_cf_period_rows = {}
+    _direct_cf_period_sets = []
+    _duration_numeric = pd.to_numeric(
+        df.get('Duration', pd.Series(np.nan, index=df.index)),
+        errors='coerce')
+    _dim_numeric = pd.to_numeric(
+        df.get('DimCount', pd.Series(0, index=df.index)),
+        errors='coerce').fillna(0)
+    for _cf_total_label, _cf_total_concepts in _direct_cf_total_concepts.items():
+        _cf_mask = (
+            df['Category'].eq('3_Cash_Flow')
+            & df['Label'].eq(_cf_total_label)
+            & df['Concept'].isin(_cf_total_concepts)
+            & _duration_numeric.between(60, 120)
+            & _dim_numeric.eq(0)
+            & pd.to_numeric(df['Value'], errors='coerce').notna()
+            & df['Q'].astype(str).isin({'Q1', 'Q2', 'Q3', 'Q4'})
+        )
+        _cf_rows = df.loc[_cf_mask].copy()
+        if not _cf_rows.empty:
+            _cf_rows = _cf_rows.sort_values(
+                ['FY', 'Q', '_Filed_dt', 'TagRank'],
+                ascending=[True, True, False, True],
+            ).drop_duplicates(subset=['FY', 'Q'], keep='first')
+        _cf_periods = set()
+        for _idx, _cf_row in _cf_rows.iterrows():
+            try:
+                _period_key = (int(_cf_row['FY']), str(_cf_row['Q']))
+            except (TypeError, ValueError):
+                continue
+            _cf_periods.add(_period_key)
+            _direct_cf_period_rows[(_cf_total_label, *_period_key)] = _cf_row
+        _direct_cf_period_sets.append(_cf_periods)
+    _complete_direct_cf_periods = (
+        set.intersection(*_direct_cf_period_sets)
+        if _direct_cf_period_sets else set()
+    )
+
     # Historically non-operating facts sharing a label were reconciled in one
     # Label/FY group.  Keep that behavior, while separating operating metrics
     # by category so their stronger aspect-aware arbitration remains isolated.
@@ -21160,6 +21374,86 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             pd.notna(ytd_start) and pd.notna(annual_start)
             and ytd_start.normalize() != annual_start.normalize()
         )
+
+    def _is_approved_dividend_transition_pair(left_concept, right_concept):
+        if cat != '3_Cash_Flow' or label != 'Dividends Paid':
+            return False
+        pair = frozenset({left_concept, right_concept})
+        return (len(pair) == 2
+                and pair in _DIVIDEND_CUMULATIVE_TRANSITION_GROUPS)
+
+    def _dividend_transition_has_value_proof(left_concept, right_concept):
+        """Prove one exact standard-tag transition from prior filed data.
+
+        This deliberately does not modify the broad alias-equivalence rule
+        below, which still requires two overlaps.  The narrow dividend rule is
+        safe with one overlap because both tags are standard US-GAAP concepts,
+        both are exact aliases of the same cash-flow line, and the overlap must
+        be prior-year, nonzero, context-identical, aspect-compatible and equal.
+        """
+        if not _is_approved_dividend_transition_pair(
+                left_concept, right_concept):
+            return False
+
+        family = df[
+            df['Category'].eq('3_Cash_Flow')
+            & df['Label'].eq('Dividends Paid')
+            & df['Concept'].isin([left_concept, right_concept])
+        ].copy()
+        if family.empty:
+            return False
+
+        # Restrict proof to directly extracted face-statement facts when the
+        # provenance fields are present.  Older caches may omit them, so absence
+        # of the optional columns does not invalidate otherwise exact evidence.
+        if 'SourceTableRole' in family.columns:
+            direct = family['SourceTableRole'].fillna('').astype(str).eq(
+                'xbrl_statement_fact')
+            if direct.any():
+                family = family[direct]
+        # ``IsCalculated`` records calculation-linkbase participation, not
+        # whether the fact itself was synthesized.  Alphabet's directly filed
+        # dividend facts legitimately carry IsCalculated=True, so direct face-
+        # statement provenance is the controlling admission signal here.
+        if family.empty:
+            return False
+
+        def _proof_contexts(concept):
+            rows = family[family['Concept'].eq(concept)].copy()
+            if rows.empty:
+                return {}
+            rows = rows.sort_values('_Filed_dt', ascending=False)
+            result = {}
+            for _, source_row in rows.iterrows():
+                source_fy = pd.to_numeric(
+                    pd.Series([source_row.get('FY')]), errors='coerce').iloc[0]
+                if pd.isna(source_fy) or int(source_fy) >= int(fy):
+                    continue
+                context = (
+                    int(source_fy), str(source_row.get('Q') or ''),
+                    str(source_row.get('Start') or ''),
+                    str(source_row.get('End') or ''),
+                    pd.to_numeric(pd.Series([source_row.get('Duration')]),
+                                  errors='coerce').iloc[0],
+                    *(
+                        _normalized_aspect_value(source_row.get(field))
+                        for field in _CUMULATIVE_ASPECT_FIELDS
+                    ),
+                )
+                if context not in result:
+                    result[context] = float(source_row['Value'])
+            return result
+
+        left_values = _proof_contexts(left_concept)
+        right_values = _proof_contexts(right_concept)
+        for context in set(left_values).intersection(right_values):
+            left_value = left_values[context]
+            right_value = right_values[context]
+            scale = max(abs(left_value), abs(right_value), 1.0)
+            if (scale > 1.0
+                    and abs(left_value - right_value) <= scale * 0.001 + 1.0):
+                return True
+        return False
 
     def _concepts_have_value_proven_equivalence(left_concept, right_concept):
         """Require at least two cross-year, aspect-matched exact overlaps."""
@@ -21803,17 +22097,43 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
             # Derive Q2 from YTD6 if missing
             if q_vals['Q2'] is None and ytd6 is not None:
+                ytd6_concept = _exact_subtraction_concept(ytd6[1])
                 q1_qt_same_tag = get_best_val(
                     'Q1', 91, 40,
-                    concept_filter=ytd6[1].get('Concept'), exact_concept=True)
+                    concept_filter=ytd6_concept, exact_concept=True)
+                q1_alias_verified = False
+
+                # Alphabet changed from PaymentsOfDividends to
+                # PaymentsOfOrdinaryDividends between Q1 and Q2.  Permit that
+                # exact standard-tag transition only when a prior cumulative
+                # context reports both tags with the same nonzero value.
+                if (q1_qt_same_tag is None
+                        and label == 'Dividends Paid'
+                        and ytd6_concept is not None):
+                    direct_q1 = q_src.get('Q1')
+                    direct_q1_concept = (
+                        _exact_subtraction_concept(direct_q1[1])
+                        if direct_q1 is not None else None)
+                    if (direct_q1 is not None
+                            and _dividend_transition_has_value_proof(
+                                ytd6_concept, direct_q1_concept)
+                            and _cumulative_aspects_compatible(
+                                ytd6[1], direct_q1[1])):
+                        q1_qt_same_tag = direct_q1
+                        q1_alias_verified = True
+
                 q2_bounds = (
                     _tail_remainder_bounds(ytd6[1], q1_qt_same_tag[1])
                     if q1_qt_same_tag is not None else None)
                 if q1_qt_same_tag is not None and q2_bounds is not None:
                     q_vals['Q2'] = ytd6[0] - q1_qt_same_tag[0]
+                    derivation_name = (
+                        'value_proven_dividend_alias_ytd6_minus_q1'
+                        if q1_alias_verified
+                        else 'exact_concept_ytd6_minus_q1')
                     best_rows['Q2'] = _derived_source_row(
                         ytd6[1], fy, 'Q2', q_vals['Q2'],
-                        'exact_concept_ytd6_minus_q1',
+                        derivation_name,
                         start=q2_bounds[0], end=q2_bounds[1],
                         operands={
                             'Expression': f"{ytd6[0]} - {q1_qt_same_tag[0]} = {q_vals['Q2']}",
@@ -21823,11 +22143,71 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                             'QuarterValue': q1_qt_same_tag[0],
                             'QuarterConcept': q1_qt_same_tag[1].get('Concept'),
                             'QuarterAccession': q1_qt_same_tag[1].get('Accession'),
+                            'AliasVerified': bool(q1_alias_verified),
+                            'AliasProof': (
+                                'prior exact cumulative context with equal '
+                                'nonzero values' if q1_alias_verified else None),
                         },
                     )
-                # A six-month YTD fact is not a discrete Q2 fact.  If Q1 is
-                # absent, there is no defensible subtraction baseline; leave
-                # Q2 blank instead of silently assuming Q1 was zero.
+                    if q1_alias_verified:
+                        print(
+                            f"  [Quarter Derivation] {label} FY{int(fy)}: "
+                            f"H1 {ytd6[0]:,.0f} minus Q1 "
+                            f"{q1_qt_same_tag[0]:,.0f} across a value-proven "
+                            "standard dividend concept transition.")
+                # A six-month YTD fact is normally not a discrete Q2 fact.
+                # Narrow exception: granular cash equity issuance is a discrete
+                # financing transaction, and a fully filed Q1 cash-flow
+                # statement with no issuance row is source evidence of zero Q1
+                # activity.  In that bounded case H1 equals Q2.  The rule never
+                # applies to revenue, expenses, dividends, debt, or generic
+                # financing rows.
+                elif (label in _EQUITY_ISSUANCE_CASH_LABELS
+                      and (int(fy), 'Q1') in _complete_direct_cf_periods):
+                    _q1_financing_row = _direct_cf_period_rows.get(
+                        ('Financing Cash Flow', int(fy), 'Q1'))
+                    _ytd_start = _parse_plain_date_cached(ytd6[1].get('Start'))
+                    _ytd_end = _parse_plain_date_cached(ytd6[1].get('End'))
+                    _q1_start = (_parse_plain_date_cached(
+                        _q1_financing_row.get('Start'))
+                        if _q1_financing_row is not None else pd.NaT)
+                    _q1_end = (_parse_plain_date_cached(
+                        _q1_financing_row.get('End'))
+                        if _q1_financing_row is not None else pd.NaT)
+                    _zero_q1_is_date_proven = (
+                        _q1_financing_row is not None
+                        and pd.notna(_ytd_start) and pd.notna(_ytd_end)
+                        and pd.notna(_q1_start) and pd.notna(_q1_end)
+                        and _ytd_start.normalize() == _q1_start.normalize()
+                        and _q1_end.normalize() < _ytd_end.normalize()
+                    )
+                    if _zero_q1_is_date_proven:
+                        _q2_start = _q1_end + pd.Timedelta(days=1)
+                        q_vals['Q2'] = ytd6[0]
+                        best_rows['Q2'] = _derived_source_row(
+                            ytd6[1], fy, 'Q2', q_vals['Q2'],
+                            'equity_issuance_ytd6_with_source_proven_zero_q1',
+                            start=_q2_start, end=_ytd_end,
+                            operands={
+                                'Expression': f"{ytd6[0]} - 0 = {q_vals['Q2']}",
+                                'YTDValue': ytd6[0],
+                                'YTDConcept': ytd6[1].get('Concept'),
+                                'YTDAccession': ytd6[1].get('Accession'),
+                                'ZeroBaselinePeriod': f"{int(fy)}-Q1",
+                                'ZeroBaselineEvidence': (
+                                    'direct operating, investing, and financing '
+                                    'cash-flow subtotals; no issuance fact'),
+                                'ZeroBaselineFinancingConcept': (
+                                    _q1_financing_row.get('Concept')),
+                                'ZeroBaselineFinancingAccession': (
+                                    _q1_financing_row.get('Accession')),
+                            },
+                        )
+                        print(
+                            f"  [Quarter Derivation] {label} FY{int(fy)}: "
+                            f"H1 {ytd6[0]:,.0f} assigned to Q2 after a complete "
+                            "direct Q1 cash-flow statement proved zero Q1 issuance."
+                        )
 
             # Derive Q3 from YTD9 if missing
             q3_ytd = ytd9 if ytd9 is not None else standalone_ytd9
@@ -28812,16 +29192,66 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         add_val('3_Cash_Flow', 'Total Net Debt Issued (Repaid)', net_total_debt[mask_total])
         
     # -- Calculate Net Equity / Shares --------------------------------
-    shares_issued = get_row('Shares Issued')
-    share_repur   = get_row('Share Repurchases')
-    
-    sh_issued_n   = pd.to_numeric(shares_issued, errors='coerce').fillna(0)
-    sh_repur_n    = pd.to_numeric(share_repur, errors='coerce').fillna(0)
-    
-    net_shares    = sh_issued_n - sh_repur_n
-    mask_shares   = shares_issued.notna() | share_repur.notna()
+    # Build the legacy parent from monetary issuance components. A filer may
+    # report either one aggregate equity-proceeds concept or separate common
+    # and preferred instruments; aggregate rows take precedence so a total and
+    # its components are never double-counted.
+    shares_issued_direct = get_row('Shares Issued')
+    _common_issued = get_row('Shares Issued - Common Stock')
+    _preferred_issued = get_row('Shares Issued - Preferred Stock')
+    _mandatory_pref_issued = get_row(
+        'Shares Issued - Mandatory Convertible Preferred Stock')
+    _combined_issued = get_row(
+        'Shares Issued - Combined Common and Preferred Stock')
+    _other_equity_issued = get_row('Shares Issued - Other Equity')
+
+    _common_n = pd.to_numeric(_common_issued, errors='coerce')
+    _preferred_n = pd.to_numeric(_preferred_issued, errors='coerce')
+    _mandatory_pref_n = pd.to_numeric(_mandatory_pref_issued, errors='coerce')
+    _combined_n = pd.to_numeric(_combined_issued, errors='coerce')
+    _other_equity_n = pd.to_numeric(_other_equity_issued, errors='coerce')
+
+    # If generic preferred proceeds and a mandatory-preferred detail carry the
+    # same amount, treat the generic line as the total rather than summing a
+    # duplicate alias. Distinct values remain additive.
+    _preferred_component = _preferred_n.fillna(0)
+    _mandatory_component = _mandatory_pref_n.fillna(0)
+    _both_pref = _preferred_n.notna() & _mandatory_pref_n.notna()
+    _pref_tol = pd.concat([_preferred_n.abs(), _mandatory_pref_n.abs()], axis=1).max(axis=1) * 0.005
+    _pref_tol = _pref_tol.clip(lower=1_000_000.0)
+    _pref_duplicate = _both_pref & ((_preferred_n - _mandatory_pref_n).abs() <= _pref_tol)
+    _preferred_total = _preferred_component + _mandatory_component
+    _preferred_total[_pref_duplicate] = _preferred_n[_pref_duplicate]
+
+    _component_total = _common_n.fillna(0) + _preferred_total.fillna(0)
+    _component_evidence = (
+        _common_n.notna() | _preferred_n.notna() | _mandatory_pref_n.notna())
+
+    # A combined common-and-preferred line is an aggregate replacement for
+    # those two instrument components. ``Other Equity`` is not an aggregate;
+    # it remains additive so a filer reporting common stock plus another
+    # equity instrument does not lose either cash flow.
+    _core_total = _combined_n.where(_combined_n.notna(), _component_total)
+    _core_evidence = _combined_n.notna() | _component_evidence
+    _granular_total = _core_total.fillna(0) + _other_equity_n.fillna(0)
+    _granular_evidence = _core_evidence | _other_equity_n.notna()
+
+    shares_issued = pd.to_numeric(
+        shares_issued_direct, errors='coerce').copy()
+    shares_issued[_granular_evidence] = _granular_total[_granular_evidence]
+    if _granular_evidence.any():
+        add_val('3_Cash_Flow', 'Shares Issued',
+                shares_issued[_granular_evidence])
+
+    share_repur = get_row('Share Repurchases')
+    sh_issued_n = pd.to_numeric(shares_issued, errors='coerce').fillna(0)
+    sh_repur_n = pd.to_numeric(share_repur, errors='coerce').fillna(0)
+
+    net_shares = sh_issued_n - sh_repur_n
+    mask_shares = shares_issued.notna() | share_repur.notna()
     if mask_shares.any():
-        add_val('3_Cash_Flow', 'Net Shares Issued (Repurchased)', net_shares[mask_shares])
+        add_val('3_Cash_Flow', 'Net Shares Issued (Repurchased)',
+                net_shares[mask_shares])
 
     # -- Financing Balance: infer missing Gross Debt Issued/Repaid ----
     # If a company only files "Net Change in Short-term Debt" (common
@@ -29517,14 +29947,17 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         _fin_contribs = {}
         
         fin_components = [
-            'Total Debt Issued', 'Total Debt Repaid', 'Share Repurchases',
-            'Dividends Paid', 'Stock Option Proceeds', 'Taxes Paid on Stock Awards'
+            'Total Debt Issued', 'Total Debt Repaid', 'Shares Issued',
+            'Share Repurchases', 'Dividends Paid', 'Stock Option Proceeds',
+            'Taxes Paid on Stock Awards'
         ]
         
         fin_sum += issued_n
         _fin_contribs['Total Debt Issued'] = issued_n.copy()
         fin_sum -= repaid_n
         _fin_contribs['Total Debt Repaid'] = -repaid_n
+        fin_sum += sh_issued_n
+        _fin_contribs['Shares Issued'] = sh_issued_n.copy()
         for _lbl0, _w0 in (('Share Repurchases', -1.0), ('Dividends Paid', -1.0),
                            ('Stock Option Proceeds', 1.0), ('Taxes Paid on Stock Awards', -1.0)):
             _v0 = get_num(_lbl0, preferred_cat='3_Cash_Flow').fillna(0)
@@ -35994,7 +36427,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-22.native-extraction.v32-rpo-narrative-ledger"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-23.native-extraction.v33-ordinary-dividends-exact"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -36164,7 +36597,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v75-cumulative-aspect-pairing"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-24.final-pivot.v77-dividend-concept-transition"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
